@@ -1,25 +1,29 @@
 // ============================================================
 // WhatsApp AI Agent — Railway Freight Export
-// Компания: ж/д грузоперевозки, экспорт из Казахстана
 // Vercel API Route: /api/webhook.js
+// Компания: ж/д грузоперевозки, экспорт из Казахстана
 // ИИ: Claude → Gemini → fallback
+// CRM: CRM_WEBHOOK_URL / AmoCRM webhook / Make / n8n
 // ============================================================
 
-const VERIFY_TOKEN       = process.env.VERIFY_TOKEN;
-const WHATSAPP_TOKEN     = process.env.WHATSAPP_TOKEN;
-const PHONE_NUMBER_ID    = process.env.PHONE_NUMBER_ID;
-const ANTHROPIC_API_KEY  = process.env.ANTHROPIC_API_KEY;
-const GEMINI_API_KEY     = process.env.GEMINI_API_KEY;
+const VERIFY_TOKEN      = process.env.VERIFY_TOKEN;
+const WHATSAPP_TOKEN    = process.env.WHATSAPP_TOKEN;
+const PHONE_NUMBER_ID   = process.env.PHONE_NUMBER_ID;
+
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+const GEMINI_API_KEY    = process.env.GEMINI_API_KEY;
+
+const CRM_WEBHOOK_URL   = process.env.CRM_WEBHOOK_URL;
 
 const GRAPH_API_VERSION = process.env.GRAPH_API_VERSION || "v25.0";
 
 const CLAUDE_MODEL = process.env.CLAUDE_MODEL || "claude-sonnet-4-20250514";
-const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.0-flash";
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash-lite";
 
 // ============================================================
 // Память диалогов
 // Важно: на Vercel память может сбрасываться при рестарте.
-// Для продакшена лучше Redis / Vercel KV / база данных.
+// Для продакшена лучше Redis / Vercel KV / Supabase / Firebase.
 // ============================================================
 
 const conversationStore = new Map();
@@ -69,18 +73,20 @@ async function handleIncomingWebhook(req) {
     const body = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
 
     const value = body?.entry?.[0]?.changes?.[0]?.value;
+
     if (!value) {
       console.log("No value in webhook body");
       return;
     }
 
-    // Игнорируем статусы доставки
+    // Игнорируем статусы доставки / прочтения
     if (value.statuses) {
       console.log("Status event ignored");
       return;
     }
 
     const messages = value.messages;
+
     if (!messages || messages.length === 0) {
       console.log("No messages in webhook body");
       return;
@@ -95,7 +101,14 @@ async function handleIncomingWebhook(req) {
       return;
     }
 
-    // Защита от повторной обработки одного и того же сообщения
+    // Имя из WhatsApp-профиля, если Meta его передала
+    const contactName =
+      value.contacts?.[0]?.profile?.name ||
+      "";
+
+    console.log(`[CONTACT] phone=${from} name="${contactName}"`);
+
+    // Защита от дублей
     if (messageId && processedMessages.has(messageId)) {
       console.log(`Duplicate message ignored: ${messageId}`);
       return;
@@ -104,23 +117,28 @@ async function handleIncomingWebhook(req) {
     if (messageId) {
       processedMessages.add(messageId);
 
-      // Чтобы Set не рос бесконечно
       if (processedMessages.size > 500) {
         const first = processedMessages.values().next().value;
         processedMessages.delete(first);
       }
     }
 
+    const session = getOrCreateSession(from);
+
+    session.whatsappPhone = from;
+    session.whatsappName = contactName || session.whatsappName || "";
+
     // Пока обрабатываем только текст
     if (message.type !== "text") {
       await sendWhatsAppMessage(
         from,
-        getUnsupportedTypeReply(getSessionLang(from))
+        getUnsupportedTypeReply(session.lang)
       );
       return;
     }
 
     const userText = message.text?.body?.trim();
+
     if (!userText) {
       console.log("Empty text message");
       return;
@@ -128,9 +146,7 @@ async function handleIncomingWebhook(req) {
 
     console.log(`[IN] from=${from} text="${userText}"`);
 
-    const session = getOrCreateSession(from);
-
-    // Определяем язык
+    // Определяем язык только в начале диалога
     if (session.messages.length === 0) {
       session.lang = detectLanguage(userText);
     }
@@ -140,9 +156,15 @@ async function handleIncomingWebhook(req) {
     // Если клиент просит живого менеджера
     if (wantsHumanAgent(userText)) {
       const reply = getHandoffReply(session.lang);
+
       appendToHistory(from, "assistant", reply);
       markLeadHot(from);
-      await notifyCRM(from, session);
+
+      const sentToCrm = await notifyCRM(from, session, "human_handoff");
+      if (sentToCrm) {
+        session.crmNotified = true;
+      }
+
       await sendWhatsAppMessage(from, reply);
       return;
     }
@@ -150,11 +172,14 @@ async function handleIncomingWebhook(req) {
     const aiReply = await askAI(session);
 
     appendToHistory(from, "assistant", aiReply);
-    updateLeadScore(from, userText, aiReply);
+    updateLeadScore(from, userText);
 
     if (session.leadScore >= 3 && !session.crmNotified) {
-      session.crmNotified = true;
-      await notifyCRM(from, session);
+      const sentToCrm = await notifyCRM(from, session, "hot_lead");
+
+      if (sentToCrm) {
+        session.crmNotified = true;
+      }
     }
 
     await sendWhatsAppMessage(from, aiReply);
@@ -169,15 +194,25 @@ async function handleIncomingWebhook(req) {
 // ============================================================
 
 async function askAI(session) {
-  const claudeReply = await askClaude(session);
-  if (claudeReply) return claudeReply;
+  console.log("[AI] Trying Claude...");
 
-  console.warn("Claude unavailable. Trying Gemini...");
+  const claudeReply = await askClaude(session);
+
+  if (claudeReply) {
+    console.log("[AI_PROVIDER] Claude");
+    return claudeReply;
+  }
+
+  console.warn("[AI] Claude unavailable. Trying Gemini...");
 
   const geminiReply = await askGemini(session);
-  if (geminiReply) return geminiReply;
 
-  console.warn("Both AI providers unavailable. Using fallback.");
+  if (geminiReply) {
+    console.log("[AI_PROVIDER] Gemini");
+    return geminiReply;
+  }
+
+  console.warn("[AI_PROVIDER] Fallback");
   return fallbackReply(session.lang);
 }
 
@@ -201,9 +236,9 @@ async function askClaude(session) {
       },
       body: JSON.stringify({
         model: CLAUDE_MODEL,
-        max_tokens: 700,
-        temperature: 0.3,
-        system: getSystemPrompt(session.lang),
+        max_tokens: 450,
+        temperature: 0.25,
+        system: getSystemPrompt(session),
         messages: buildClaudeMessages(session),
       }),
     });
@@ -216,6 +251,7 @@ async function askClaude(session) {
     }
 
     const reply = data.content?.[0]?.text?.trim();
+
     return reply ? limitWhatsAppText(cleanReply(reply)) : null;
 
   } catch (error) {
@@ -247,13 +283,13 @@ async function askGemini(session) {
         systemInstruction: {
           parts: [
             {
-              text: getSystemPrompt(session.lang),
+              text: getSystemPrompt(session),
             },
           ],
         },
         generationConfig: {
-          temperature: 0.3,
-          maxOutputTokens: 700,
+          temperature: 0.25,
+          maxOutputTokens: 450,
           responseMimeType: "text/plain",
         },
         safetySettings: [
@@ -289,10 +325,11 @@ async function askGemini(session) {
 
     if (finishReason === "SAFETY" || finishReason === "RECITATION") {
       console.warn("Gemini blocked response:", finishReason);
-      return fallbackReply(session.lang);
+      return null;
     }
 
     const reply = data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
+
     return reply ? limitWhatsAppText(cleanReply(reply)) : null;
 
   } catch (error) {
@@ -337,11 +374,14 @@ function buildGeminiContents(session) {
 
 function getOrCreateSession(phone) {
   const now = Date.now();
+
   let session = conversationStore.get(phone);
 
   if (!session || now - session.lastTs > HISTORY_TTL_MS) {
     session = {
       phone,
+      whatsappPhone: phone,
+      whatsappName: "",
       messages: [],
       lang: "ru",
       leadScore: 0,
@@ -350,6 +390,7 @@ function getOrCreateSession(phone) {
     };
 
     conversationStore.set(phone, session);
+
   } else {
     session.lastTs = now;
   }
@@ -359,6 +400,7 @@ function getOrCreateSession(phone) {
 
 function appendToHistory(phone, role, content) {
   const session = conversationStore.get(phone);
+
   if (!session) return;
 
   session.messages.push({
@@ -372,10 +414,6 @@ function appendToHistory(phone, role, content) {
       ...session.messages.slice(-(MAX_HISTORY_TURNS * 2)),
     ];
   }
-}
-
-function getSessionLang(phone) {
-  return conversationStore.get(phone)?.lang || "ru";
 }
 
 // ============================================================
@@ -417,15 +455,16 @@ function detectLanguage(text) {
 function wantsHumanAgent(text) {
   const lower = text.toLowerCase();
 
-  return /\b(менеджер|оператор|человек|живой|хочу позвонить|соедини|перезвони|мне нужен человек|не с ботом|не бот|свяжитесь|позвоните)\b/.test(lower);
+  return /\b(менеджер|оператор|человек|живой|хочу позвонить|соедини|перезвони|мне нужен человек|не с ботом|не бот|свяжитесь|позвоните|договор|контракт)\b/.test(lower);
 }
 
 // ============================================================
 // Оценка лида
 // ============================================================
 
-function updateLeadScore(phone, userText, aiReply) {
+function updateLeadScore(phone, userText) {
   const session = conversationStore.get(phone);
+
   if (!session) return;
 
   const lower = userText.toLowerCase();
@@ -434,7 +473,7 @@ function updateLeadScore(phone, userText, aiReply) {
     session.leadScore++;
   }
 
-  if (/\b(маршрут|откуда|куда|направление|станция)\b/.test(lower)) {
+  if (/\b(маршрут|откуда|куда|направление|станция|алматы|ташкент|душанбе|афганистан|узбекистан|таджикистан)\b/.test(lower)) {
     session.leadScore++;
   }
 
@@ -442,7 +481,7 @@ function updateLeadScore(phone, userText, aiReply) {
     session.leadScore++;
   }
 
-  if (/\b(контракт|договор|заявка|оформить|отправить)\b/.test(lower)) {
+  if (/\b(контракт|договор|заявка|оформить|отправить|перевезти)\b/.test(lower)) {
     session.leadScore++;
   }
 
@@ -459,59 +498,92 @@ function updateLeadScore(phone, userText, aiReply) {
 
 function markLeadHot(phone) {
   const session = conversationStore.get(phone);
+
   if (session) {
     session.leadScore = 10;
   }
 }
 
 // ============================================================
-// CRM / уведомление менеджеру
-// Можно подключить AMOCRM_WEBHOOK_URL или свой webhook
+// CRM / AmoCRM / Make / n8n webhook
 // ============================================================
 
-async function notifyCRM(phone, session) {
+async function notifyCRM(phone, session, reason = "lead") {
   const summary = session.messages
     .filter((m) => m.role === "user")
     .map((m) => m.content)
     .join(" | ");
 
+  const leadPayload = {
+    source: "WhatsApp Bot",
+    reason,
+    phone,
+    whatsapp_phone: session.whatsappPhone || phone,
+    whatsapp_name: session.whatsappName || "",
+    lang: session.lang,
+    leadScore: session.leadScore,
+    messages: summary,
+    title: buildLeadTitle(session),
+    createdAt: new Date().toISOString(),
+  };
+
   console.log(
-    `[CRM] HOT LEAD phone=${phone} lang=${session.lang} summary="${summary}"`
+    `[CRM] HOT LEAD phone=${phone} name="${leadPayload.whatsapp_name}" score=${session.leadScore} reason=${reason}`
   );
 
-  const CRM_WEBHOOK = process.env.CRM_WEBHOOK_URL;
-
-  if (!CRM_WEBHOOK) {
-    return;
+  if (!CRM_WEBHOOK_URL) {
+    console.warn("[CRM] CRM_WEBHOOK_URL is missing. Lead was not sent.");
+    return false;
   }
 
   try {
-    await fetch(CRM_WEBHOOK, {
+    const response = await fetch(CRM_WEBHOOK_URL, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({
-        phone,
-        lang: session.lang,
-        leadScore: session.leadScore,
-        messages: summary,
-        createdAt: new Date().toISOString(),
-      }),
+      body: JSON.stringify(leadPayload),
     });
 
+    const responseText = await response.text();
+
+    if (!response.ok) {
+      console.error("[CRM] Webhook error:", response.status, responseText);
+      return false;
+    }
+
     console.log("[CRM] Lead sent to CRM webhook");
+    console.log("[CRM_RESPONSE]", responseText);
+
+    return true;
 
   } catch (error) {
-    console.error("CRM webhook error:", error);
+    console.error("[CRM] Webhook request failed:", error);
+    return false;
   }
+}
+
+function buildLeadTitle(session) {
+  const lastUserMessage =
+    session.messages
+      .filter((m) => m.role === "user")
+      .map((m) => m.content)
+      .pop() || "";
+
+  const shortText = lastUserMessage.length > 80
+    ? lastUserMessage.slice(0, 80) + "..."
+    : lastUserMessage;
+
+  return `Заявка WhatsApp: ${shortText}`;
 }
 
 // ============================================================
 // Системный промпт
 // ============================================================
 
-function getSystemPrompt(lang = "ru") {
+function getSystemPrompt(session = {}) {
+  const lang = session.lang || "ru";
+
   const langInstruction =
     {
       ru: "Отвечай ТОЛЬКО на русском языке.",
@@ -520,10 +592,21 @@ function getSystemPrompt(lang = "ru") {
       tj: "Танҳо ба забони тоҷикӣ ҷавоб деҳ.",
     }[lang] || "Отвечай ТОЛЬКО на русском языке.";
 
+  const profileName = session.whatsappName || "";
+  const phone = session.whatsappPhone || session.phone || "";
+
   return `
-Ты AI-менеджер компании, которая оказывает услуги железнодорожных грузоперевозок.
+Ты виртуальный менеджер компании, которая оказывает услуги железнодорожных грузоперевозок.
 
 ЯЗЫК: ${langInstruction}
+
+Данные из WhatsApp:
+- WhatsApp-номер клиента уже определён автоматически: ${phone || "номер будет взят из webhook"}
+- Имя из WhatsApp-профиля: ${profileName || "не передано"}
+- Номер телефона повторно НЕ спрашивай.
+- Не выводи номер клиента в ответе без необходимости.
+- Если имя из профиля выглядит нормальным, можешь использовать его аккуратно.
+- Если имени нет, попроси только имя и компанию.
 
 Компания специализируется на:
 - экспорте грузов из Казахстана в Узбекистан, Таджикистан, Афганистан;
@@ -534,18 +617,24 @@ function getSystemPrompt(lang = "ru") {
 - отслеживании вагонов через системы КТЖ.
 
 Твоя роль:
-Ты вежливый, уверенный и профессиональный менеджер по железнодорожным перевозкам.
-Твоя задача — понять потребность клиента, задать уточняющие вопросы и подготовить заявку для передачи менеджеру.
+Ты общаешься как внимательный менеджер по железнодорожным перевозкам.
+Клиент должен чувствовать, что его поняли, а не что он получил шаблонный ответ.
+Не говори, что ты бот, AI или языковая модель без необходимости.
+Если клиент прямо спросит "вы бот?" или "это человек?", честно ответь:
+"Я виртуальный помощник компании, помогаю быстро собрать заявку. Точный расчёт подтвердит менеджер."
 
-Стиль:
-- отвечай кратко, понятно и по-деловому;
+Стиль общения:
+- отвечай естественно, спокойно и по-деловому;
+- не начинай каждый ответ одинаково;
+- не пиши "чем могу помочь", если клиент уже описал задачу;
+- сначала кратко подтверди, что понял запрос;
+- используй детали клиента: груз, маршрут, вес, дату, тип вагона;
+- задавай только 1–2 уточняющих вопроса за раз;
 - не используй Markdown: никаких **, ##, таблиц;
-- не называй себя ботом, AI или языковой моделью;
-- не давай точных цен без маршрута, веса, типа груза и даты;
+- не давай точных цен без проверки маршрута, веса, груза, даты и наличия вагона;
 - не гарантируй наличие вагонов без проверки менеджером;
-- если данных мало, задай 1–2 уточняющих вопроса;
-- если клиент просит точный расчёт, договор или отправку груза — предложи передать заявку менеджеру;
-- заканчивай ответ вопросом или мягким призывом к действию.
+- не спрашивай номер телефона повторно;
+- в конце ответа мягко веди клиента к следующему шагу.
 
 Данные, которые нужно собрать:
 1. Какой груз нужно перевезти
@@ -555,8 +644,8 @@ function getSystemPrompt(lang = "ru") {
 5. Тип вагона, если клиент знает
 6. Желаемая дата отправки
 7. Нужна ли помощь с документами
-8. Имя клиента и компания
-9. Контактный номер для менеджера
+8. Имя клиента и компания, если этого ещё нет
+9. Номер телефона не спрашивай: WhatsApp-номер уже сохранён автоматически
 
 Маршруты и сроки справочно:
 - Казахстан → Узбекистан: 3–5 суток
@@ -576,8 +665,12 @@ function getSystemPrompt(lang = "ru") {
 - Инвойс и счёт-фактура готовятся по данным клиента
 
 Передача менеджеру:
-Когда клиент указал маршрут и груз или просит расчёт, напиши:
-"Могу передать заявку менеджеру для точного расчёта. Напишите, пожалуйста, ваше имя, компанию и удобный номер для связи."
+Когда клиент указал груз, маршрут, вес или просит расчёт, не проси номер телефона повторно.
+Напиши естественно:
+"Понял, данные для предварительной заявки уже есть. Ваш WhatsApp-номер сохранён, поэтому менеджер сможет связаться с вами напрямую. Напишите, пожалуйста, ваше имя и компанию — передам заявку на точный расчёт."
+
+Если клиент уже написал имя и компанию, ответь:
+"Спасибо, заявку передаю менеджеру. Он проверит тариф, наличие подходящего вагона и свяжется с вами для точного расчёта."
 
 Рабочее время менеджера:
 09:00–18:00, Алматы.
@@ -642,10 +735,10 @@ async function sendWhatsAppMessage(to, body) {
 
 function getUnsupportedTypeReply(lang = "ru") {
   const texts = {
-    ru: "Спасибо за сообщение. Пока лучше всего обрабатываю текст. Напишите, пожалуйста, какой груз нужно перевезти и по какому маршруту?",
-    kz: "Хабарыңыз үшін рахмет. Әзірге мәтіндік хабарларды жақсы өңдеймін. Қандай жүк және қай бағыт бойынша тасымалдау керек екенін жазыңыз.",
-    uz: "Xabaringiz uchun rahmat. Hozircha matnli xabarlarni yaxshiroq tushunaman. Qanday yuk va qaysi yo'nalish bo'yicha tashish kerakligini yozing.",
-    tj: "Ташаккур барои паём. Ҳоло матнро беҳтар коркард мекунам. Лутфан нависед, кадом бор ва аз куҷо ба куҷо интиқол дода шавад.",
+    ru: "Спасибо, сообщение получил. Сейчас лучше всего обрабатываю текст. Напишите, пожалуйста, какой груз нужно перевезти и по какому маршруту.",
+    kz: "Хабарыңызды алдым. Әзірге мәтіндік хабарларды жақсы өңдеймін. Қандай жүк және қай бағыт бойынша тасымалдау керек екенін жазыңыз.",
+    uz: "Xabaringizni oldim. Hozircha matnli xabarlarni yaxshiroq tushunaman. Qanday yuk va qaysi yo'nalish bo'yicha tashish kerakligini yozing.",
+    tj: "Паёматонро гирифтам. Ҳоло матнро беҳтар коркард мекунам. Лутфан нависед, кадом бор ва аз куҷо ба куҷо интиқол дода шавад.",
   };
 
   return texts[lang] || texts.ru;
@@ -653,10 +746,10 @@ function getUnsupportedTypeReply(lang = "ru") {
 
 function getHandoffReply(lang = "ru") {
   const texts = {
-    ru: "Понял, передаю вас менеджеру. Чтобы ускорить расчёт, напишите, пожалуйста, ваше имя, компанию и удобный номер для связи.",
-    kz: "Түсіндім, сізді менеджерге бағыттаймын. Есептеуді жылдамдату үшін атыңызды, компанияңызды және байланыс нөміріңізді жазыңыз.",
-    uz: "Tushundim, sizni menejerga yo'naltiraman. Hisob-kitobni tezlashtirish uchun ismingiz, kompaniyangiz va aloqa raqamingizni yozing.",
-    tj: "Фаҳмидам, шуморо ба менеҷер равона мекунам. Барои тезтар ҳисоб кардан, ном, ширкат ва рақами тамосро нависед.",
+    ru: "Понял, передаю заявку менеджеру. Ваш WhatsApp-номер уже сохранён, повторно его писать не нужно. Напишите, пожалуйста, только ваше имя и компанию, чтобы менеджер быстрее подготовил расчёт.",
+    kz: "Түсіндім, өтінімді менеджерге беремін. WhatsApp-нөміріңіз сақталды, оны қайта жазудың қажеті жоқ. Есептеуді тездету үшін атыңыз бен компанияңызды жазыңыз.",
+    uz: "Tushundim, arizani menejerga yo'naltiraman. WhatsApp raqamingiz saqlandi, uni qayta yozish shart emas. Hisob-kitobni tezlashtirish uchun ismingiz va kompaniyangizni yozing.",
+    tj: "Фаҳмидам, дархостро ба менеҷер мерасонам. Рақами WhatsApp-и шумо сабт шуд, дубора навиштан лозим нест. Барои тезтар омода кардани ҳисоб, ном ва ширкататонро нависед.",
   };
 
   return texts[lang] || texts.ru;
@@ -665,40 +758,44 @@ function getHandoffReply(lang = "ru") {
 function fallbackReply(lang = "ru") {
   const texts = {
     ru:
-      "Спасибо за сообщение. Сейчас я могу принять вашу заявку для менеджера.\n\n" +
+      "Спасибо, сообщение получил. Могу принять вашу заявку и передать менеджеру.\n\n" +
       "Напишите, пожалуйста:\n" +
       "1. Какой груз нужно перевезти?\n" +
       "2. Откуда и куда?\n" +
       "3. Вес в тоннах?\n" +
       "4. Желаемая дата отправки?\n" +
-      "5. Ваше имя и номер для связи?",
+      "5. Ваше имя и компанию.\n\n" +
+      "WhatsApp-номер уже сохранён, повторно его писать не нужно.",
 
     kz:
-      "Хабарыңыз үшін рахмет. Қазір өтінішіңізді менеджерге қабылдай аламын.\n\n" +
+      "Хабарыңызды алдым. Өтінімді қабылдап, менеджерге бере аламын.\n\n" +
       "Жазыңыз, өтінемін:\n" +
       "1. Қандай жүк тасымалдау керек?\n" +
       "2. Қайдан және қайда?\n" +
       "3. Салмағы қанша тонна?\n" +
       "4. Жөнелту күні?\n" +
-      "5. Атыңыз және байланыс нөміріңіз?",
+      "5. Атыңыз және компанияңыз.\n\n" +
+      "WhatsApp-нөміріңіз сақталды, қайта жазудың қажеті жоқ.",
 
     uz:
-      "Xabaringiz uchun rahmat. Hozir arizangizni menejer uchun qabul qila olaman.\n\n" +
+      "Xabaringizni oldim. Arizangizni qabul qilib, menejerga yubora olaman.\n\n" +
       "Iltimos, yozing:\n" +
       "1. Qanday yuk tashish kerak?\n" +
       "2. Qayerdan va qayerga?\n" +
       "3. Og'irligi necha tonna?\n" +
       "4. Jo'natish sanasi?\n" +
-      "5. Ismingiz va aloqa raqamingiz?",
+      "5. Ismingiz va kompaniyangiz.\n\n" +
+      "WhatsApp raqamingiz saqlandi, uni qayta yozish shart emas.",
 
     tj:
-      "Ташаккур барои паём. Ҳоло метавонам дархости шуморо барои менеҷер қабул кунам.\n\n" +
+      "Паёматонро гирифтам. Метавонам дархостро қабул карда, ба менеҷер расонам.\n\n" +
       "Лутфан нависед:\n" +
       "1. Кадом борро интиқол додан лозим?\n" +
       "2. Аз куҷо ва ба куҷо?\n" +
       "3. Вазн чанд тонна аст?\n" +
       "4. Санаи фиристодан?\n" +
-      "5. Ном ва рақами тамос?",
+      "5. Ном ва ширкати шумо.\n\n" +
+      "Рақами WhatsApp-и шумо сабт шуд, дубора навиштан лозим нест.",
   };
 
   return texts[lang] || texts.ru;
@@ -713,11 +810,12 @@ function cleanReply(text) {
     .replace(/\*\*/g, "")
     .replace(/#{1,6}\s/g, "")
     .replace(/\|/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
     .trim();
 }
 
 function limitWhatsAppText(text) {
-  const MAX_LENGTH = 1600;
+  const MAX_LENGTH = 1400;
 
   if (text.length <= MAX_LENGTH) {
     return text;
