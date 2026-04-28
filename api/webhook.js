@@ -5,82 +5,82 @@ const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
-const CLAUDE_MODEL = process.env.CLAUDE_MODEL || "claude-sonnet-4-5";
+// ИСПРАВЛЕНИЕ #1: правильное название модели Claude
+const CLAUDE_MODEL = process.env.CLAUDE_MODEL || "claude-sonnet-4-20250514";
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.0-flash";
 
 export default async function handler(req, res) {
   if (req.method === "GET") {
-    return verifyWebhook(req, res);
+    const mode = req.query["hub.mode"];
+    const token = req.query["hub.verify_token"];
+    const challenge = req.query["hub.challenge"];
+
+    if (mode === "subscribe" && token === VERIFY_TOKEN) {
+      console.log("Webhook verified");
+      return res.status(200).send(challenge);
+    } else {
+      return res.status(403).send("Forbidden");
+    }
   }
 
   if (req.method === "POST") {
-    return handleIncomingWebhook(req, res);
+    // ИСПРАВЛЕНИЕ #2: сразу отвечаем 200, чтобы Meta не делала повторные запросы
+    res.status(200).send("EVENT_RECEIVED");
+    // Обрабатываем асинхронно после отправки ответа
+    handleIncomingWebhook(req).catch((err) =>
+      console.error("Unhandled webhook error:", err)
+    );
+    return;
   }
 
   return res.status(405).send("Method Not Allowed");
 }
 
-function verifyWebhook(req, res) {
-  const mode = req.query["hub.mode"];
-  const token = req.query["hub.verify_token"];
-  const challenge = req.query["hub.challenge"];
-
-  if (mode === "subscribe" && token === VERIFY_TOKEN) {
-    console.log("Webhook verified successfully");
-    return res.status(200).send(challenge);
-  }
-
-  console.warn("Webhook verification failed");
-  return res.status(403).send("Forbidden");
-}
-
-async function handleIncomingWebhook(req, res) {
+async function handleIncomingWebhook(req) {
   try {
     const value = req.body?.entry?.[0]?.changes?.[0]?.value;
 
+    if (!value) {
+      console.log("No value in webhook body");
+      return;
+    }
+
+    // Статус доставки — игнорируем
     if (value?.statuses) {
       console.log("Received message status update");
-      return res.status(200).send("EVENT_RECEIVED");
+      return;
     }
 
-    const message = value?.messages?.[0];
-
-    if (!message) {
-      console.log("No incoming message found");
-      return res.status(200).send("EVENT_RECEIVED");
+    const messages = value?.messages;
+    if (!messages || messages.length === 0) {
+      console.log("No messages in webhook");
+      return;
     }
 
+    const message = messages[0];
     const from = message.from;
 
+    // Только текстовые сообщения
     if (message.type !== "text") {
       await sendWhatsAppMessage(
         from,
-        " Спасибо за сообщение. Сейчас я лучше обрабатываю текстовые запросы. Напишите, пожалуйста, что вас интересует: перевозка груза, расчет стоимости, маршрут, вагон/контейнер или отслеживание?"
+        "Спасибо за сообщение. Сейчас я лучше обрабатываю текстовые запросы. Напишите, пожалуйста, что вас интересует: перевозка груза, расчет стоимости, маршрут, вагон/контейнер или отслеживание?"
       );
-
-      return res.status(200).send("EVENT_RECEIVED");
+      return;
     }
 
-    const userText = message.text?.body?.trim();
-
+    const userText = message.text?.body;
     if (!userText) {
-      return res.status(200).send("EVENT_RECEIVED");
+      console.log("Empty text body");
+      return;
     }
 
-    console.log("Incoming WhatsApp message:", {
-      from,
-      text: userText
-    });
+    console.log("Incoming message from", from, ":", userText);
 
     const aiReply = await askAI(userText);
-
     await sendWhatsAppMessage(from, aiReply);
-
-    return res.status(200).send("EVENT_RECEIVED");
   } catch (error) {
-    console.error("Webhook error:", error);
-
-    return res.status(200).send("EVENT_RECEIVED");
+    console.error("Webhook processing error:", error);
   }
 }
 
@@ -92,21 +92,17 @@ async function handleIncomingWebhook(req, res) {
  */
 async function askAI(userText) {
   const claudeReply = await askClaude(userText);
-
   if (claudeReply) {
     return claudeReply;
   }
 
   console.warn("Claude unavailable. Trying Gemini...");
-
   const geminiReply = await askGemini(userText);
-
   if (geminiReply) {
     return geminiReply;
   }
 
   console.warn("Gemini unavailable. Using fallback reply.");
-
   return fallbackReply();
 }
 
@@ -120,9 +116,9 @@ async function askClaude(userText) {
     const response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
+        "Content-Type": "application/json",
         "x-api-key": ANTHROPIC_API_KEY,
         "anthropic-version": "2023-06-01",
-        "Content-Type": "application/json"
       },
       body: JSON.stringify({
         model: CLAUDE_MODEL,
@@ -132,21 +128,20 @@ async function askClaude(userText) {
         messages: [
           {
             role: "user",
-            content: userText
-          }
-        ]
-      })
+            content: userText,
+          },
+        ],
+      }),
     });
 
     const data = await response.json();
 
     if (!response.ok) {
-      console.error("Claude API error:", data);
+      console.error("Claude API error:", JSON.stringify(data));
       return null;
     }
 
     const reply = data.content?.[0]?.text?.trim();
-
     if (!reply) {
       return null;
     }
@@ -165,44 +160,48 @@ async function askGemini(userText) {
   }
 
   try {
+    // ИСПРАВЛЕНИЕ #3: правильная структура запроса к Gemini с system instruction
     const response = await fetch(
       `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`,
       {
         method: "POST",
         headers: {
-          "Content-Type": "application/json"
+          "Content-Type": "application/json",
         },
         body: JSON.stringify({
+          systemInstruction: {
+            parts: [
+              {
+                text: getSystemPrompt(),
+              },
+            ],
+          },
           generationConfig: {
             temperature: 0.3,
-            maxOutputTokens: 600
+            maxOutputTokens: 600,
           },
           contents: [
             {
               role: "user",
               parts: [
                 {
-                  text: `${getSystemPrompt()}
-
-Сообщение клиента:
-${userText}`
-                }
-              ]
-            }
-          ]
-        })
+                  text: userText,
+                },
+              ],
+            },
+          ],
+        }),
       }
     );
 
     const data = await response.json();
 
     if (!response.ok) {
-      console.error("Gemini API error:", data);
+      console.error("Gemini API error:", JSON.stringify(data));
       return null;
     }
 
     const reply = data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
-
     if (!reply) {
       return null;
     }
@@ -234,7 +233,6 @@ function getSystemPrompt() {
 Стиль общения:
 - отвечай на русском языке, если клиент пишет по-русски;
 - отвечай на казахском языке, если клиент пишет по-казахски;
-- если клиент пишет коротко или непонятно, задай 1–2 уточняющих вопроса;
 - пиши кратко, понятно и профессионально;
 - не используй сложные технические термины без необходимости;
 - не говори, что ты языковая модель или искусственный интеллект;
@@ -246,8 +244,7 @@ function getSystemPrompt() {
 - не используй много эмодзи;
 - максимум 1 эмодзи в сообщении.
 
-Главная задача:
-Собрать данные для расчета перевозки:
+Главная задача — собрать данные для расчета перевозки:
 1. что нужно перевезти;
 2. откуда — город, станция или адрес отправления;
 3. куда — город, станция или адрес назначения;
@@ -264,94 +261,59 @@ function getSystemPrompt() {
 
 Если клиент спрашивает цену:
 Объясни, что точный расчет зависит от маршрута, типа груза, веса, объема, вида подвижного состава, даты отправки и дополнительных услуг.
-Попроси данные для расчета:
-- груз;
-- откуда;
-- куда;
-- вес;
-- объем;
-- дата отправки.
+Попроси данные для расчета: груз, откуда, куда, вес, объем, дата отправки.
 
-Если клиент спрашивает “что вы делаете?”:
-Кратко объясни:
-“Мы организуем железнодорожные перевозки грузов: подбираем маршрут, тип вагона или контейнера, рассчитываем стоимость и сопровождаем заявку до отправки.”
+Если клиент спрашивает "что вы делаете?":
+Кратко объясни: "Мы организуем железнодорожные перевозки грузов: подбираем маршрут, тип вагона или контейнера, рассчитываем стоимость и сопровождаем заявку до отправки."
 
 Если клиент хочет отследить груз:
-Попроси один из данных:
-- номер вагона;
-- номер контейнера;
-- номер накладной;
-- номер заявки;
-- станция отправления и назначения.
+Попроси один из данных: номер вагона, номер контейнера, номер накладной, номер заявки или станции отправления и назначения.
 
 Если клиент спрашивает про международную перевозку:
-Уточни:
-- страна отправления;
-- страна назначения;
-- груз;
-- код ТН ВЭД, если есть;
-- вес и объем;
-- нужна ли помощь с документами.
+Уточни: страна отправления, страна назначения, груз, код ТН ВЭД (если есть), вес и объем, нужна ли помощь с документами.
 
-Если клиент пишет “нужна перевозка”:
-Ответь:
-“Конечно, помогу. Напишите, пожалуйста: какой груз, откуда и куда нужно перевезти, примерный вес/объем и желаемую дату отправки.”
+Если клиент пишет "нужна перевозка":
+Ответь: "Конечно, помогу. Напишите, пожалуйста: какой груз, откуда и куда нужно перевезти, примерный вес/объем и желаемую дату отправки."
 
-Если клиент готов оставить заявку:
-Попроси написать:
-- имя;
-- компания;
-- телефон;
-- груз;
-- маршрут;
-- вес/объем;
-- дата отправки.
-
-Если данных достаточно:
+Если данных достаточно для заявки:
 Кратко подтверди, что заявка принята в работу, и напиши, что менеджер подготовит расчет после проверки маршрута и условий.
 
-Тон:
-Спокойный, уверенный, деловой, без давления.
+Тон: спокойный, уверенный, деловой, без давления.
 `;
 }
 
 async function sendWhatsAppMessage(to, body) {
   if (!WHATSAPP_TOKEN || !PHONE_NUMBER_ID) {
-    console.error("WhatsApp credentials are missing");
+    console.error("WHATSAPP_TOKEN or PHONE_NUMBER_ID is missing");
     return;
   }
 
   try {
     const response = await fetch(
-      `https://graph.facebook.com/v25.0/${PHONE_NUMBER_ID}/messages`,
+      `https://graph.facebook.com/v18.0/${PHONE_NUMBER_ID}/messages`,
       {
         method: "POST",
         headers: {
           Authorization: `Bearer ${WHATSAPP_TOKEN}`,
-          "Content-Type": "application/json"
+          "Content-Type": "application/json",
         },
         body: JSON.stringify({
           messaging_product: "whatsapp",
-          to,
+          to: to,
           type: "text",
-          text: {
-            preview_url: false,
-            body
-          }
-        })
+          text: { body: body },
+        }),
       }
     );
 
-    const data = await response.json();
-
     if (!response.ok) {
-      console.error("WhatsApp API error:", data);
-      return;
+      const err = await response.json();
+      console.error("WhatsApp send error:", JSON.stringify(err));
+    } else {
+      console.log("Message sent to", to);
     }
-
-    console.log("WhatsApp message sent:", data);
   } catch (error) {
-    console.error("Failed to send WhatsApp message:", error);
+    console.error("sendWhatsAppMessage failed:", error);
   }
 }
 
@@ -369,12 +331,21 @@ function fallbackReply() {
 5. Ваше имя и номер для связи.`;
 }
 
+// ИСПРАВЛЕНИЕ #4: разумный лимит для WhatsApp (1600 символов)
 function limitWhatsAppText(text) {
-  const maxLength = 3500;
-
-  if (text.length <= maxLength) {
+  const MAX_LENGTH = 1600;
+  if (text.length <= MAX_LENGTH) {
     return text;
   }
-
-  return text.slice(0, maxLength - 50) + "\n\nПродолжу после вашего ответа.";
+  // Обрезаем по последнему предложению в пределах лимита
+  const truncated = text.substring(0, MAX_LENGTH);
+  const lastPeriod = Math.max(
+    truncated.lastIndexOf("."),
+    truncated.lastIndexOf("!"),
+    truncated.lastIndexOf("?")
+  );
+  if (lastPeriod > MAX_LENGTH * 0.7) {
+    return truncated.substring(0, lastPeriod + 1);
+  }
+  return truncated + "...";
 }
