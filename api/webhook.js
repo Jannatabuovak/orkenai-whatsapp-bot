@@ -509,6 +509,9 @@ function markLeadHot(phone) {
 // ============================================================
 
 async function notifyCRM(phone, session, reason = "lead") {
+  const CRM_WEBHOOK_URL =
+    process.env.CRM_WEBHOOK_URL || process.env.AMOCRM_WEBHOOK_URL;
+
   const summary = session.messages
     .filter((m) => m.role === "user")
     .map((m) => m.content)
@@ -521,14 +524,14 @@ async function notifyCRM(phone, session, reason = "lead") {
     whatsapp_phone: session.whatsappPhone || phone,
     whatsapp_name: session.whatsappName || "",
     lang: session.lang,
-    leadScore: session.leadScore,
+    leadScore: session.leadScore || 0,
     messages: summary,
-    title: buildLeadTitle(session),
+    title: `Заявка WhatsApp: ${summary.slice(0, 100)}`,
     createdAt: new Date().toISOString(),
   };
 
   console.log(
-    `[CRM] HOT LEAD phone=${phone} name="${leadPayload.whatsapp_name}" score=${session.leadScore} reason=${reason}`
+    `[CRM] HOT LEAD phone=${phone} score=${session.leadScore} hasCrmUrl=${Boolean(CRM_WEBHOOK_URL)}`
   );
 
   if (!CRM_WEBHOOK_URL) {
@@ -556,25 +559,10 @@ async function notifyCRM(phone, session, reason = "lead") {
     console.log("[CRM_RESPONSE]", responseText);
 
     return true;
-
   } catch (error) {
     console.error("[CRM] Webhook request failed:", error);
     return false;
   }
-}
-
-function buildLeadTitle(session) {
-  const lastUserMessage =
-    session.messages
-      .filter((m) => m.role === "user")
-      .map((m) => m.content)
-      .pop() || "";
-
-  const shortText = lastUserMessage.length > 80
-    ? lastUserMessage.slice(0, 80) + "..."
-    : lastUserMessage;
-
-  return `Заявка WhatsApp: ${shortText}`;
 }
 
 // ============================================================
