@@ -1,9 +1,12 @@
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
+
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
 const CLAUDE_MODEL = process.env.CLAUDE_MODEL || "claude-sonnet-4-5";
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.0-flash";
 
 export default async function handler(req, res) {
   if (req.method === "GET") {
@@ -35,7 +38,6 @@ async function handleIncomingWebhook(req, res) {
   try {
     const value = req.body?.entry?.[0]?.changes?.[0]?.value;
 
-    // Если это статус доставки, а не сообщение клиента — просто подтверждаем получение
     if (value?.statuses) {
       console.log("Received message status update");
       return res.status(200).send("EVENT_RECEIVED");
@@ -50,11 +52,10 @@ async function handleIncomingWebhook(req, res) {
 
     const from = message.from;
 
-    // Обрабатываем только текстовые сообщения
     if (message.type !== "text") {
       await sendWhatsAppMessage(
         from,
-        "Спасибо за сообщение. Сейчас я лучше понимаю текстовые запросы. Напишите, пожалуйста, что вас интересует: сайт, WhatsApp-бот или автоматизация?"
+        "Спасибо за сообщение. Сейчас я лучше обрабатываю текстовые запросы. Напишите, пожалуйста, что вас интересует: перевозка груза, расчет стоимости, маршрут, вагон/контейнер или отслеживание?"
       );
 
       return res.status(200).send("EVENT_RECEIVED");
@@ -71,7 +72,7 @@ async function handleIncomingWebhook(req, res) {
       text: userText
     });
 
-    const aiReply = await askClaude(userText);
+    const aiReply = await askAI(userText);
 
     await sendWhatsAppMessage(from, aiReply);
 
@@ -79,15 +80,40 @@ async function handleIncomingWebhook(req, res) {
   } catch (error) {
     console.error("Webhook error:", error);
 
-    // Meta должна получить 200, иначе будет повторять webhook-запросы
     return res.status(200).send("EVENT_RECEIVED");
   }
+}
+
+/**
+ * Главная функция:
+ * 1. Сначала пробует Claude
+ * 2. Если Claude недоступен — пробует Gemini
+ * 3. Если оба недоступны — возвращает fallbackReply()
+ */
+async function askAI(userText) {
+  const claudeReply = await askClaude(userText);
+
+  if (claudeReply) {
+    return claudeReply;
+  }
+
+  console.warn("Claude unavailable. Trying Gemini...");
+
+  const geminiReply = await askGemini(userText);
+
+  if (geminiReply) {
+    return geminiReply;
+  }
+
+  console.warn("Gemini unavailable. Using fallback reply.");
+
+  return fallbackReply();
 }
 
 async function askClaude(userText) {
   if (!ANTHROPIC_API_KEY) {
     console.error("ANTHROPIC_API_KEY is missing");
-    return fallbackReply();
+    return null;
   }
 
   try {
@@ -100,8 +126,8 @@ async function askClaude(userText) {
       },
       body: JSON.stringify({
         model: CLAUDE_MODEL,
-        max_tokens: 500,
-        temperature: 0.4,
+        max_tokens: 600,
+        temperature: 0.3,
         system: getSystemPrompt(),
         messages: [
           {
@@ -116,91 +142,176 @@ async function askClaude(userText) {
 
     if (!response.ok) {
       console.error("Claude API error:", data);
-      return fallbackReply();
+      return null;
     }
 
     const reply = data.content?.[0]?.text?.trim();
 
     if (!reply) {
-      return fallbackReply();
+      return null;
     }
 
     return limitWhatsAppText(reply);
   } catch (error) {
     console.error("Claude request failed:", error);
-    return fallbackReply();
+    return null;
+  }
+}
+
+async function askGemini(userText) {
+  if (!GEMINI_API_KEY) {
+    console.error("GEMINI_API_KEY is missing");
+    return null;
+  }
+
+  try {
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          generationConfig: {
+            temperature: 0.3,
+            maxOutputTokens: 600
+          },
+          contents: [
+            {
+              role: "user",
+              parts: [
+                {
+                  text: `${getSystemPrompt()}
+
+Сообщение клиента:
+${userText}`
+                }
+              ]
+            }
+          ]
+        })
+      }
+    );
+
+    const data = await response.json();
+
+    if (!response.ok) {
+      console.error("Gemini API error:", data);
+      return null;
+    }
+
+    const reply = data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
+
+    if (!reply) {
+      return null;
+    }
+
+    return limitWhatsAppText(reply);
+  } catch (error) {
+    console.error("Gemini request failed:", error);
+    return null;
   }
 }
 
 function getSystemPrompt() {
   return `
-Ты AI-менеджер цифрового агентства OrkenAI.kz.
+Ты AI-менеджер компании, которая оказывает услуги железнодорожных грузоперевозок.
 
-OrkenAI помогает бизнесу в Казахстане создавать:
-- сайты и лендинги;
-- WhatsApp-ботов;
-- Telegram-ботов;
-- AI-ассистентов;
-- автоматизацию заявок;
-- интеграции с Google Sheets, Telegram, CRM, сайтами и формами;
-- цифровые системы для продаж, клиентского сервиса и внутренних процессов.
+Компания помогает клиентам с организацией перевозок грузов по Казахстану и международным направлениям:
+- железнодорожные перевозки;
+- перевозка грузов в вагонах и контейнерах;
+- подбор оптимального маршрута;
+- предварительный расчет стоимости;
+- консультация по станциям отправления и назначения;
+- сопровождение заявки на перевозку;
+- консультация по документам;
+- помощь с отслеживанием статуса перевозки, если клиент предоставил номер вагона, контейнера, накладной или заявки.
 
 Твоя роль:
-Ты не просто бот, а вежливый менеджер OrkenAI, который помогает клиенту понять, какое решение ему подойдёт.
+Ты вежливый менеджер по железнодорожным перевозкам. Твоя задача — быстро понять потребность клиента, собрать данные для заявки и передать клиента менеджеру для точного расчета.
 
 Стиль общения:
 - отвечай на русском языке, если клиент пишет по-русски;
 - отвечай на казахском языке, если клиент пишет по-казахски;
-- пиши кратко, тепло и профессионально;
+- если клиент пишет коротко или непонятно, задай 1–2 уточняющих вопроса;
+- пиши кратко, понятно и профессионально;
 - не используй сложные технические термины без необходимости;
-- не говори, что ты языковая модель;
-- не обещай невозможного;
-- не придумывай факты о клиенте;
-- не делай слишком длинные ответы;
-- веди клиента к заявке.
+- не говори, что ты языковая модель или искусственный интеллект;
+- не обещай точную цену без данных;
+- не обещай наличие вагонов без проверки менеджером;
+- не обещай точные сроки доставки без проверки маршрута;
+- не выдумывай тарифы, станции, условия, документы и статусы;
+- не используй Markdown-таблицы;
+- не используй много эмодзи;
+- максимум 1 эмодзи в сообщении.
 
 Главная задача:
-Понять, что нужно клиенту, и мягко собрать данные:
-1. сфера бизнеса;
-2. что хочет автоматизировать или создать;
-3. есть ли сайт/Instagram/WhatsApp;
-4. какие услуги или товары продаёт;
-5. нужен ли сайт, бот, AI-помощник или комплексное решение;
-6. когда нужно запустить;
-7. как можно связаться с клиентом.
-
-Цены-ориентиры:
-- лендинг — от 150 000 ₸;
-- сайт с WhatsApp-заявками — от 250 000 ₸;
-- WhatsApp-бот — от 200 000 ₸;
-- AI-бот с GPT/Claude — от 350 000 ₸;
-- автоматизация процесса — рассчитывается индивидуально.
+Собрать данные для расчета перевозки:
+1. что нужно перевезти;
+2. откуда — город, станция или адрес отправления;
+3. куда — город, станция или адрес назначения;
+4. вес груза;
+5. объем груза;
+6. количество мест;
+7. тип упаковки;
+8. желаемая дата отправки;
+9. нужен ли вагон, контейнер или клиент не знает;
+10. есть ли особые условия: температурный режим, негабарит, опасный груз, срочность;
+11. имя клиента;
+12. компания;
+13. контактный номер.
 
 Если клиент спрашивает цену:
-Назови ориентир и объясни, что точная стоимость зависит от задачи, количества страниц, сценариев бота, интеграций и уровня автоматизации.
+Объясни, что точный расчет зависит от маршрута, типа груза, веса, объема, вида подвижного состава, даты отправки и дополнительных услуг.
+Попроси данные для расчета:
+- груз;
+- откуда;
+- куда;
+- вес;
+- объем;
+- дата отправки.
 
 Если клиент спрашивает “что вы делаете?”:
-Объясни, что OrkenAI создаёт не просто сайты, а цифровые системы: сайт + WhatsApp + AI-бот + заявки + автоматизация.
+Кратко объясни:
+“Мы организуем железнодорожные перевозки грузов: подбираем маршрут, тип вагона или контейнера, рассчитываем стоимость и сопровождаем заявку до отправки.”
 
-Если клиент пишет непонятно:
-Задай уточняющий вопрос и предложи выбрать:
-1 — сайт
-2 — WhatsApp-бот
-3 — AI-ассистент
-4 — автоматизация
-5 — узнать стоимость
+Если клиент хочет отследить груз:
+Попроси один из данных:
+- номер вагона;
+- номер контейнера;
+- номер накладной;
+- номер заявки;
+- станция отправления и назначения.
 
-Если клиент готов заказать:
-Попроси коротко написать:
-- сфера бизнеса;
-- что нужно сделать;
-- город;
-- желаемый срок;
-- имя для связи.
+Если клиент спрашивает про международную перевозку:
+Уточни:
+- страна отправления;
+- страна назначения;
+- груз;
+- код ТН ВЭД, если есть;
+- вес и объем;
+- нужна ли помощь с документами.
 
-Не отправляй Markdown-таблицы.
-Не используй слишком много эмодзи.
-Максимум 1 эмодзи в сообщении.
+Если клиент пишет “нужна перевозка”:
+Ответь:
+“Конечно, помогу. Напишите, пожалуйста: какой груз, откуда и куда нужно перевезти, примерный вес/объем и желаемую дату отправки.”
+
+Если клиент готов оставить заявку:
+Попроси написать:
+- имя;
+- компания;
+- телефон;
+- груз;
+- маршрут;
+- вес/объем;
+- дата отправки.
+
+Если данных достаточно:
+Кратко подтверди, что заявка принята в работу, и напиши, что менеджер подготовит расчет после проверки маршрута и условий.
+
+Тон:
+Спокойный, уверенный, деловой, без давления.
 `;
 }
 
@@ -247,15 +358,15 @@ async function sendWhatsAppMessage(to, body) {
 function fallbackReply() {
   return `Спасибо за сообщение.
 
-Сейчас AI-помощник временно недоступен, но я всё равно помогу сориентироваться.
+Сейчас AI-помощник временно недоступен, но я помогу принять заявку на железнодорожную перевозку.
 
-Напишите, пожалуйста, что вас интересует:
+Напишите, пожалуйста:
 
-1 — сайт
-2 — WhatsApp-бот
-3 — AI-ассистент
-4 — автоматизация
-5 — узнать стоимость`;
+1. Какой груз нужно перевезти?
+2. Откуда и куда?
+3. Вес и объем груза?
+4. Желаемая дата отправки?
+5. Ваше имя и номер для связи.`;
 }
 
 function limitWhatsAppText(text) {
