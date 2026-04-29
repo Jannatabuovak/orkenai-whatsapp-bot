@@ -1,9 +1,10 @@
 // ============================================================
-// WhatsApp AI Agent — Railway Freight Export
+// WhatsApp AI Agent — Railway Freight Export + Kazakhstan Domestic
 // Vercel API Route: /api/webhook.js
-// Компания: ж/д грузоперевозки, экспорт из Казахстана
+// Компания: ж/д грузоперевозки по Казахстану и на экспорт
 // ИИ: Claude → Gemini → fallback
 // CRM: CRM_WEBHOOK_URL / AMOCRM_WEBHOOK_URL / Make / n8n / webhook.site
+// Excel/Sheets: EXCEL_WEBHOOK_URL / GOOGLE_SHEETS_WEBHOOK_URL
 // ============================================================
 
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
@@ -15,6 +16,11 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
 const CRM_WEBHOOK_URL =
   process.env.CRM_WEBHOOK_URL || process.env.AMOCRM_WEBHOOK_URL;
+
+const EXCEL_WEBHOOK_URL =
+  process.env.EXCEL_WEBHOOK_URL || process.env.GOOGLE_SHEETS_WEBHOOK_URL;
+
+const EXCEL_SECRET = process.env.EXCEL_SECRET || "";
 
 const GRAPH_API_VERSION = process.env.GRAPH_API_VERSION || "v25.0";
 
@@ -125,7 +131,16 @@ async function handleIncomingWebhook(req) {
     session.whatsappName = contactName || session.whatsappName || "";
 
     if (message.type !== "text") {
-      await sendWhatsAppMessage(from, getUnsupportedTypeReply(session.lang));
+      const reply = getUnsupportedTypeReply(session.lang);
+
+      appendToHistory(from, "assistant", reply);
+
+      await saveToExcel(from, session, "bot_reply", {
+        aiReply: reply,
+        reason: "unsupported_message_type",
+      });
+
+      await sendWhatsAppMessage(from, reply);
       return;
     }
 
@@ -144,6 +159,14 @@ async function handleIncomingWebhook(req) {
 
     appendToHistory(from, "user", userText);
 
+    updateLeadDataFromText(session, userText);
+    console.log("[LEAD_DATA]", JSON.stringify(session.leadData));
+
+    await saveToExcel(from, session, "incoming_message", {
+      userText,
+      reason: "incoming_message",
+    });
+
     // ========================================================
     // РУЧНОЙ ТЕСТ CRM
     // Напишите боту: тест crm
@@ -157,16 +180,55 @@ async function handleIncomingWebhook(req) {
       const sentToCrm = await notifyCRM(from, session, "manual_crm_test");
 
       const reply = sentToCrm
-        ? "Тест CRM выполнен: заявка отправлена в webhook. Проверьте webhook.site — должен появиться POST."
+        ? "Тест CRM выполнен: заявка отправлена в webhook. Проверьте webhook.site или вашу CRM-систему — должен появиться POST."
         : "Тест CRM не прошёл. Проверьте Vercel Logs: возможно, CRM_WEBHOOK_URL не указан или webhook вернул ошибку.";
 
       appendToHistory(from, "assistant", reply);
+
+      await saveToExcel(from, session, "bot_reply", {
+        userText,
+        aiReply: reply,
+        reason: "manual_crm_test",
+      });
+
       await sendWhatsAppMessage(from, reply);
       return;
     }
 
     // ========================================================
-    // Если клиент просит менеджера / договор / контракт
+    // РУЧНОЙ ТЕСТ EXCEL / GOOGLE SHEETS
+    // Напишите боту: тест excel
+    // ========================================================
+
+    if (/^тест\s*(excel|эксель|sheet|sheets|таблица)$/i.test(userText)) {
+      console.log("[EXCEL_TEST] Manual Excel test started");
+
+      markLeadHot(from);
+
+      const saved = await saveToExcel(from, session, "manual_excel_test", {
+        userText,
+        reason: "manual_excel_test",
+      });
+
+      const reply = saved
+        ? "Тест Excel выполнен: диалог и заявка сохранены в таблицу."
+        : "Тест Excel не прошёл. Проверьте EXCEL_WEBHOOK_URL, EXCEL_SECRET и Apps Script.";
+
+      appendToHistory(from, "assistant", reply);
+
+      await saveToExcel(from, session, "bot_reply", {
+        userText,
+        aiReply: reply,
+        reason: "manual_excel_test_reply",
+      });
+
+      await sendWhatsAppMessage(from, reply);
+      return;
+    }
+
+    // ========================================================
+    // Если клиент явно просит человека / звонок
+    // Бот всё равно отвечает как менеджер, но заявку фиксирует
     // ========================================================
 
     if (wantsHumanAgent(userText)) {
@@ -175,7 +237,13 @@ async function handleIncomingWebhook(req) {
       appendToHistory(from, "assistant", reply);
       markLeadHot(from);
 
-      const sentToCrm = await notifyCRM(from, session, "human_handoff");
+      await saveToExcel(from, session, "lead", {
+        userText,
+        aiReply: reply,
+        reason: "human_callback_request",
+      });
+
+      const sentToCrm = await notifyCRM(from, session, "human_callback_request");
 
       if (sentToCrm) {
         session.crmNotified = true;
@@ -193,27 +261,43 @@ async function handleIncomingWebhook(req) {
 
     appendToHistory(from, "assistant", aiReply);
 
+    await saveToExcel(from, session, "bot_reply", {
+      userText,
+      aiReply,
+      reason: "bot_reply",
+    });
+
     updateLeadScore(from, userText);
 
-    const aiSaysHandoff =
-      /передаю.*заявк|передать.*заявк|заявк.*переда|передаю.*менеджер|менеджер.*свяжется|точн.*расч[её]т|оформ.*заявк|проверит тариф|наличие.*вагон/i.test(
+    const aiSaysLeadReady =
+      /заявк.*зафикс|оформляю.*заявк|беру.*в\s+работ|подготов.*расч[её]т|провер.*тариф|наличие.*вагон|проверю.*тариф|расч[её]т.*подготов/i.test(
         aiReply
       );
 
     console.log("[CRM_CHECK]", {
       phone: from,
       leadScore: session.leadScore,
-      aiSaysHandoff,
+      aiSaysLeadReady,
       crmNotified: session.crmNotified,
       hasCrmUrl: Boolean(CRM_WEBHOOK_URL),
+      hasExcelUrl: Boolean(EXCEL_WEBHOOK_URL),
+      leadData: session.leadData,
     });
 
-    if ((session.leadScore >= 3 || aiSaysHandoff) && !session.crmNotified) {
-      const sentToCrm = await notifyCRM(
-        from,
-        session,
-        "hot_lead_or_ai_handoff"
-      );
+    if ((session.leadScore >= 3 || aiSaysLeadReady) && !session.leadSaved) {
+      const reason = "hot_lead_or_lead_ready";
+
+      const savedLead = await saveToExcel(from, session, "lead", {
+        userText,
+        aiReply,
+        reason,
+      });
+
+      if (savedLead) {
+        session.leadSaved = true;
+      }
+
+      const sentToCrm = await notifyCRM(from, session, reason);
 
       if (sentToCrm) {
         session.crmNotified = true;
@@ -377,7 +461,7 @@ async function askGemini(session) {
 }
 
 // ============================================================
-// Формат истории для Claude
+// Формат истории
 // ============================================================
 
 function buildClaudeMessages(session) {
@@ -388,10 +472,6 @@ function buildClaudeMessages(session) {
       content: m.content,
     }));
 }
-
-// ============================================================
-// Формат истории для Gemini
-// ============================================================
 
 function buildGeminiContents(session) {
   return session.messages
@@ -424,12 +504,45 @@ function getOrCreateSession(phone) {
       lang: "ru",
       leadScore: 0,
       crmNotified: false,
+      leadSaved: false,
       lastTs: now,
+
+      leadData: {
+        routeType: "",
+        cargo: "",
+        origin: "",
+        destination: "",
+        weight: "",
+        wagonType: "",
+        shippingDate: "",
+        documentsHelp: "",
+        clientName: "",
+        company: "",
+      },
     };
 
     conversationStore.set(phone, session);
   } else {
     session.lastTs = now;
+
+    if (!session.leadData) {
+      session.leadData = {
+        routeType: "",
+        cargo: "",
+        origin: "",
+        destination: "",
+        weight: "",
+        wagonType: "",
+        shippingDate: "",
+        documentsHelp: "",
+        clientName: "",
+        company: "",
+      };
+    }
+
+    if (typeof session.leadSaved === "undefined") {
+      session.leadSaved = false;
+    }
   }
 
   return session;
@@ -451,6 +564,310 @@ function appendToHistory(phone, role, content) {
       ...session.messages.slice(-(MAX_HISTORY_TURNS * 2)),
     ];
   }
+}
+
+// ============================================================
+// Память по заявке
+// ============================================================
+
+function updateLeadDataFromText(session, text) {
+  if (!session.leadData) {
+    session.leadData = {
+      routeType: "",
+      cargo: "",
+      origin: "",
+      destination: "",
+      weight: "",
+      wagonType: "",
+      shippingDate: "",
+      documentsHelp: "",
+      clientName: "",
+      company: "",
+    };
+  }
+
+  const lower = text.toLowerCase();
+
+  if (/по\s+казахстану|внутри\s+казахстана|по\s+рк|внутри\s+рк/.test(lower)) {
+    session.leadData.routeType = "внутренняя перевозка по Казахстану";
+  }
+
+  const cargoMatch = lower.match(
+    /(пшениц[ауы]?|ячмен[ья]?|кукуруз[ауы]?|рис|сахар|масл[оа]|подсолнечн[а-я\s]*масл[оа]|лен|льнян[а-я\s]*сем[яе]|хлопков[а-я\s]*сем[яе]|зерно|мук[ауы]?|цемент|уголь|металл|оборудовани[ея]|паллет[а-я]*|стройматериал[а-я]*|техника|груз)/
+  );
+
+  if (cargoMatch) {
+    session.leadData.cargo = cargoMatch[0];
+  }
+
+  const weightMatch = lower.match(
+    /(\d+[.,]?\d*)\s*(тонн|тонна|тонны|т|кг|килограмм|килограммов)/
+  );
+
+  if (weightMatch) {
+    session.leadData.weight = `${weightMatch[1]} ${weightMatch[2]}`;
+  }
+
+  if (/хоппер|зерновоз/.test(lower)) {
+    session.leadData.wagonType = "хоппер / зерновоз";
+  } else if (/крыт/.test(lower)) {
+    session.leadData.wagonType = "крытый вагон";
+  } else if (/платформ/.test(lower)) {
+    session.leadData.wagonType = "платформа";
+  } else if (/контейнер/.test(lower)) {
+    session.leadData.wagonType = "контейнер";
+  } else if (/не\s+знаю|не\s+знаем|подскажите\s+вагон|какой\s+вагон/.test(lower)) {
+    session.leadData.wagonType = "нужно подобрать тип вагона";
+  }
+
+  if (/послезавтра/.test(lower)) {
+    session.leadData.shippingDate = "послезавтра";
+  } else if (/завтра/.test(lower)) {
+    session.leadData.shippingDate = "завтра";
+  } else if (/сегодня/.test(lower)) {
+    session.leadData.shippingDate = "сегодня";
+  } else if (/следующ[а-я]+\s+недел/.test(lower)) {
+    session.leadData.shippingDate = "на следующей неделе";
+  } else {
+    const dateMatch = lower.match(/(\d{1,2}[./-]\d{1,2}([./-]\d{2,4})?)/);
+
+    if (dateMatch) {
+      session.leadData.shippingDate = dateMatch[1];
+    }
+  }
+
+  const routeMatch = text.match(
+    /(?:из|от)\s+(.+?)\s+(?:в|до|на)\s+(.+?)(?:[.,!?;]|$)/i
+  );
+
+  if (routeMatch) {
+    session.leadData.origin = cleanPlaceName(routeMatch[1]);
+    session.leadData.destination = cleanPlaceName(routeMatch[2]);
+  }
+
+  fillKnownCityRoute(session, lower);
+  detectRouteType(session, lower);
+
+  const lastAssistant = getLastAssistantMessage(session);
+  const assistantAskedDocs = /документ|ст-1|ст1|фито|сертификат|деклараци|инвойс|тн\s*вэд/i.test(
+    lastAssistant
+  );
+
+  if (
+    assistantAskedDocs &&
+    /^(нет|не нужно|не надо|без документов|документы не нужны|нет спасибо|нет, спасибо)$/i.test(
+      text.trim()
+    )
+  ) {
+    session.leadData.documentsHelp = "не нужна помощь с документами";
+  } else if (
+    /помощь\s+с\s+документами\s+не\s+нужн|документы\s+не\s+нужны|без\s+документов/.test(
+      lower
+    )
+  ) {
+    session.leadData.documentsHelp = "не нужна помощь с документами";
+  } else if (
+    /нужн[аоы]?\s+.*документ|ст-1|ст1|фито|фитосанитар|сертификат|деклараци|инвойс|тн\s*вэд/.test(
+      lower
+    )
+  ) {
+    session.leadData.documentsHelp = "нужна помощь с документами";
+  }
+
+  const nameMatch = text.match(
+    /(?:меня зовут|я\s+|имя\s+)([А-ЯЁA-ZӘІҢҒҮҰҚӨҺ][а-яёa-zәіңғүұқөһ]{2,20})/i
+  );
+
+  if (nameMatch) {
+    session.leadData.clientName = nameMatch[1];
+  } else if (!session.leadData.clientName && session.whatsappName) {
+    session.leadData.clientName = session.whatsappName;
+  }
+
+  const companyMatch = text.match(
+    /(?:компания|тоо|ип|ТОО|ИП)\s+([А-ЯЁA-Z0-9а-яёa-zәіңғүұқөһ\s"«»._-]{2,60})/i
+  );
+
+  if (companyMatch) {
+    session.leadData.company = companyMatch[0].trim();
+  }
+}
+
+function fillKnownCityRoute(session, lower) {
+  const cityMap = [
+    ["алматы", "Алматы"],
+    ["астана", "Астана"],
+    ["нур-султан", "Астана"],
+    ["караганда", "Караганда"],
+    ["қарағанды", "Караганда"],
+    ["шымкент", "Шымкент"],
+    ["актобе", "Актобе"],
+    ["ақтөбе", "Актобе"],
+    ["атырау", "Атырау"],
+    ["актау", "Актау"],
+    ["ақтау", "Актау"],
+    ["костанай", "Костанай"],
+    ["қостанай", "Костанай"],
+    ["павлодар", "Павлодар"],
+    ["семей", "Семей"],
+    ["усть-каменогорск", "Усть-Каменогорск"],
+    ["оскемен", "Усть-Каменогорск"],
+    ["өскемен", "Усть-Каменогорск"],
+    ["тараз", "Тараз"],
+    ["кызылорда", "Кызылорда"],
+    ["қызылорда", "Кызылорда"],
+    ["кокшетау", "Кокшетау"],
+    ["көкшетау", "Кокшетау"],
+    ["петропавловск", "Петропавловск"],
+    ["уральск", "Уральск"],
+    ["орал", "Уральск"],
+    ["туркестан", "Туркестан"],
+    ["ташкент", "Ташкент"],
+    ["душанбе", "Душанбе"],
+    ["афганистан", "Афганистан"],
+    ["узбекистан", "Узбекистан"],
+    ["таджикистан", "Таджикистан"],
+  ];
+
+  for (const [raw, nice] of cityMap) {
+    const cityRegexFrom = new RegExp(`(?:из|от)\\s+${escapeRegExp(raw)}\\b`, "i");
+    const cityRegexTo = new RegExp(`(?:в|до|на)\\s+${escapeRegExp(raw)}\\b`, "i");
+
+    if (!session.leadData.origin && cityRegexFrom.test(lower)) {
+      session.leadData.origin = nice;
+    }
+
+    if (!session.leadData.destination && cityRegexTo.test(lower)) {
+      session.leadData.destination = nice;
+    }
+  }
+}
+
+function detectRouteType(session, lower = "") {
+  const origin = normalizeForCompare(session.leadData.origin);
+  const destination = normalizeForCompare(session.leadData.destination);
+
+  const kzCities = [
+    "алматы",
+    "астана",
+    "караганда",
+    "шымкент",
+    "актобе",
+    "атырау",
+    "актау",
+    "костанай",
+    "павлодар",
+    "семей",
+    "усть-каменогорск",
+    "тараз",
+    "кызылорда",
+    "кокшетау",
+    "петропавловск",
+    "уральск",
+    "туркестан",
+  ];
+
+  const exportPlaces = [
+    "ташкент",
+    "узбекистан",
+    "душанбе",
+    "таджикистан",
+    "афганистан",
+  ];
+
+  if (/по\s+казахстану|внутри\s+казахстана|по\s+рк|внутри\s+рк/.test(lower)) {
+    session.leadData.routeType = "внутренняя перевозка по Казахстану";
+    return;
+  }
+
+  if (exportPlaces.some((place) => destination.includes(place))) {
+    session.leadData.routeType = "экспортная / международная перевозка";
+    return;
+  }
+
+  if (
+    kzCities.some((city) => origin.includes(city)) &&
+    kzCities.some((city) => destination.includes(city))
+  ) {
+    session.leadData.routeType = "внутренняя перевозка по Казахстану";
+    return;
+  }
+
+  if (!session.leadData.routeType && destination) {
+    session.leadData.routeType = "тип маршрута нужно уточнить";
+  }
+}
+
+function getLastAssistantMessage(session) {
+  const assistantMessages = session.messages.filter((m) => m.role === "assistant");
+  return assistantMessages.length
+    ? assistantMessages[assistantMessages.length - 1].content || ""
+    : "";
+}
+
+function cleanPlaceName(value) {
+  return String(value || "")
+    .replace(/[.,!?;:]+$/g, "")
+    .replace(
+      /\b(вес|нужен|нужна|нужно|отправка|отправить|сегодня|завтра|послезавтра|хоппер|крытый|платформа|контейнер|вагон|тонн|тонна|тонны|кг|килограмм|стоимость|цена|посчитайте|расч[её]т).*$/i,
+      ""
+    )
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function normalizeForCompare(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/ё/g, "е")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function buildLeadDataSummary(session) {
+  const data = session.leadData || {};
+
+  const known = [];
+  const missing = [];
+
+  if (data.routeType) known.push(`тип маршрута: ${data.routeType}`);
+  else missing.push("тип маршрута");
+
+  if (data.cargo) known.push(`груз: ${data.cargo}`);
+  else missing.push("груз");
+
+  if (data.origin) known.push(`откуда: ${data.origin}`);
+  else missing.push("откуда");
+
+  if (data.destination) known.push(`куда: ${data.destination}`);
+  else missing.push("куда");
+
+  if (data.weight) known.push(`вес: ${data.weight}`);
+  else missing.push("вес");
+
+  if (data.wagonType) known.push(`тип вагона: ${data.wagonType}`);
+  else missing.push("тип вагона");
+
+  if (data.shippingDate) known.push(`дата отправки: ${data.shippingDate}`);
+  else missing.push("дата отправки");
+
+  if (data.documentsHelp) known.push(`документы: ${data.documentsHelp}`);
+  else missing.push("нужна ли помощь с документами");
+
+  if (data.clientName) known.push(`имя клиента: ${data.clientName}`);
+  else missing.push("имя клиента");
+
+  if (data.company) known.push(`компания: ${data.company}`);
+  else missing.push("компания");
+
+  return {
+    knownText: known.length ? known.join("; ") : "пока нет заполненных данных",
+    missingText: missing.length ? missing.join(", ") : "нет, основные данные собраны",
+  };
 }
 
 // ============================================================
@@ -491,13 +908,13 @@ function detectLanguage(text) {
 }
 
 // ============================================================
-// Запрос живого менеджера
+// Запрос человека / звонка
 // ============================================================
 
 function wantsHumanAgent(text) {
   const lower = text.toLowerCase();
 
-  return /\b(менеджер|оператор|человек|живой|хочу позвонить|соедини|перезвони|мне нужен человек|не с ботом|не бот|свяжитесь|позвоните|договор|контракт)\b/.test(
+  return /\b(оператор|человек|живой|хочу позвонить|соедини|перезвони|мне нужен человек|не с ботом|не бот|свяжитесь|позвоните)\b/.test(
     lower
   );
 }
@@ -524,7 +941,7 @@ function updateLeadScore(phone, userText) {
   }
 
   if (
-    /\b(маршрут|откуда|куда|направление|станция|алматы|ташкент|душанбе|афганистан|узбекистан|таджикистан)\b/.test(
+    /\b(маршрут|откуда|куда|направление|станция|по казахстану|внутри казахстана|алматы|астана|караганда|шымкент|актобе|атырау|актау|костанай|павлодар|семей|усть-каменогорск|тараз|кызылорда|кокшетау|петропавловск|уральск|туркестан|ташкент|душанбе|афганистан|узбекистан|таджикистан)\b/.test(
       lower
     )
   ) {
@@ -580,6 +997,7 @@ async function notifyCRM(phone, session, reason = "lead") {
     whatsapp_name: session.whatsappName || "",
     lang: session.lang,
     leadScore: session.leadScore || 0,
+    leadData: session.leadData || {},
     messages: summary,
     title: `Заявка WhatsApp: ${summary.slice(0, 100)}`,
     createdAt: new Date().toISOString(),
@@ -623,6 +1041,77 @@ async function notifyCRM(phone, session, reason = "lead") {
 }
 
 // ============================================================
+// Сохранение диалога и заявки в Excel / Google Sheets
+// ============================================================
+
+async function saveToExcel(phone, session, eventType, options = {}) {
+  if (!EXCEL_WEBHOOK_URL) {
+    console.warn("[EXCEL] EXCEL_WEBHOOK_URL is missing. Nothing saved.");
+    return false;
+  }
+
+  const dialogText = session.messages
+    .map((m) => {
+      const role = m.role === "assistant" ? "Бот" : "Клиент";
+      return `${role}: ${m.content}`;
+    })
+    .join("\n");
+
+  const userMessages = session.messages
+    .filter((m) => m.role === "user")
+    .map((m) => m.content)
+    .join(" | ");
+
+  const payload = {
+    secret: EXCEL_SECRET,
+    eventType,
+    timestamp: new Date().toISOString(),
+
+    phone,
+    whatsapp_phone: session.whatsappPhone || phone,
+    whatsapp_name: session.whatsappName || "",
+
+    lang: session.lang,
+    leadScore: session.leadScore || 0,
+    leadData: session.leadData || {},
+
+    userText: options.userText || "",
+    aiReply: options.aiReply || "",
+    reason: options.reason || "",
+
+    messages: userMessages,
+    dialogText,
+  };
+
+  console.log("[EXCEL] Saving event:", eventType);
+
+  try {
+    const response = await fetch(EXCEL_WEBHOOK_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    });
+
+    const responseText = await response.text();
+
+    if (!response.ok) {
+      console.error("[EXCEL] Save error:", response.status, responseText);
+      return false;
+    }
+
+    console.log("[EXCEL] Saved successfully");
+    console.log("[EXCEL_RESPONSE]", responseText);
+
+    return true;
+  } catch (error) {
+    console.error("[EXCEL] Request failed:", error);
+    return false;
+  }
+}
+
+// ============================================================
 // Системный промпт
 // ============================================================
 
@@ -639,9 +1128,10 @@ function getSystemPrompt(session = {}) {
 
   const profileName = session.whatsappName || "";
   const phone = session.whatsappPhone || session.phone || "";
+  const leadMemory = buildLeadDataSummary(session);
 
   return `
-Ты виртуальный менеджер компании, которая оказывает услуги железнодорожных грузоперевозок.
+Ты менеджер компании, которая оказывает услуги железнодорожных грузоперевозок по Казахстану и на экспорт.
 
 ЯЗЫК: ${langInstruction}
 
@@ -653,20 +1143,56 @@ function getSystemPrompt(session = {}) {
 - Если имя из профиля выглядит нормальным, можешь использовать его аккуратно.
 - Если имени нет, попроси только имя и компанию.
 
+Память по текущей заявке:
+- Уже известно: ${leadMemory.knownText}
+- Ещё не хватает: ${leadMemory.missingText}
+
+Критически важное правило:
+- Не задавай повторно вопросы по данным, которые уже есть в блоке "Уже известно".
+- Если груз, маршрут, вес, тип вагона или дата уже известны — не спрашивай их снова.
+- Если клиент уже ответил "нет" по документам — больше не спрашивай про документы.
+- Если не хватает нескольких данных, спроси максимум 1–2 самых важных.
+- Если основные данные уже собраны, не продолжай расспросы, а зафиксируй заявку и переходи к расчёту.
+- Не говори клиенту "передам менеджеру", "менеджер свяжется", "соединяю с менеджером".
+- Общайся так, будто ты сам принимаешь заявку и сам ведёшь клиента.
+
 Компания специализируется на:
-- экспорте грузов из Казахстана в Узбекистан, Таджикистан, Афганистан;
-- железнодорожных перевозках сельскохозяйственной продукции: пшеница, ячмень, кукуруза, рис, сахар, масло, льняное семя, хлопковое семя и другие грузы;
-- подборе типа вагона: крытый вагон, хоппер/зерновоз, платформа;
-- предварительном расчёте тарифов;
-- оформлении контрактов и документов: СТ-1, фитосанитарный сертификат, ТН ВЭД, экспортная декларация, инвойс;
+- железнодорожных грузоперевозках по Казахстану: между городами, станциями, складами, элеваторами, производственными площадками;
+- экспортных перевозках из Казахстана в Узбекистан, Таджикистан, Афганистан и другие направления;
+- перевозках сельскохозяйственной продукции: пшеница, ячмень, кукуруза, рис, сахар, масло, льняное семя, хлопковое семя и другие грузы;
+- перевозках промышленных, паллетированных, тарных, сыпучих и нестандартных грузов;
+- подборе типа вагона: крытый вагон, хоппер/зерновоз, платформа, контейнер;
+- предварительном расчёте тарифа по маршруту, весу, типу груза и дате отправки;
+- оформлении заявок, договоров, счетов и сопроводительных документов;
 - отслеживании вагонов через системы КТЖ.
 
+Важно по типу маршрута:
+Если маршрут внутри Казахстана, не называй перевозку экспортной.
+Если клиент пишет "по Казахстану", "из Алматы в Астану", "из Шымкента в Караганду" и т.п., веди диалог как по внутренней перевозке.
+Для внутренних перевозок не спрашивай автоматически СТ-1, экспортную декларацию и ТН ВЭД.
+СТ-1, экспортная декларация и таможенные вопросы актуальны только для международных/экспортных направлений.
+
 Твоя роль:
-Ты общаешься как внимательный менеджер по железнодорожным перевозкам.
-Клиент должен чувствовать, что его поняли, а не что он получил шаблонный ответ.
+Ты общаешься как менеджер по железнодорожным перевозкам: уверенно, спокойно, по делу и от первого лица.
+Используй формулировки:
+- "зафиксировал заявку"
+- "проверю тариф"
+- "подготовлю расчёт"
+- "уточню наличие подходящего вагона"
+- "оформляю заявку"
+- "беру в работу"
+- "по этим данным можно подготовить расчёт"
+
+Не используй формулировки:
+- "передам менеджеру"
+- "менеджер свяжется"
+- "соединяю с менеджером"
+- "ожидайте звонка менеджера"
+
+Клиент должен чувствовать, что общается с ответственным специалистом, а не получает шаблонный ответ.
 Не говори, что ты бот, AI или языковая модель без необходимости.
 Если клиент прямо спросит "вы бот?" или "это человек?", честно ответь:
-"Я виртуальный помощник компании, помогаю быстро собрать заявку. Точный расчёт подтвердит менеджер."
+"Я виртуальный помощник компании, помогаю быстро принять заявку и подготовить расчёт. Все данные фиксирую для обработки."
 
 Стиль общения:
 - отвечай естественно, спокойно и по-деловому;
@@ -675,49 +1201,70 @@ function getSystemPrompt(session = {}) {
 - сначала кратко подтверди, что понял запрос;
 - используй детали клиента: груз, маршрут, вес, дату, тип вагона;
 - задавай только 1–2 уточняющих вопроса за раз;
+- перед каждым вопросом проверь блок "Память по текущей заявке";
+- не повторяй вопрос, если ответ уже есть в памяти заявки;
+- если клиент уже дал данные, лучше подтверди их и переходи к следующему шагу;
 - не используй Markdown;
 - не давай точных цен без проверки маршрута, веса, груза, даты и наличия вагона;
-- не гарантируй наличие вагонов без проверки менеджером;
+- не гарантируй наличие вагонов без проверки;
 - не спрашивай номер телефона повторно;
 - в конце ответа мягко веди клиента к следующему шагу.
 
 Данные, которые нужно собрать:
 1. Какой груз нужно перевезти
-2. Откуда: город или станция отправления в Казахстане
-3. Куда: страна, город или станция назначения
+2. Откуда: город или станция отправления
+3. Куда: город, станция или страна назначения
 4. Вес груза в тоннах
 5. Тип вагона, если клиент знает
 6. Желаемая дата отправки
-7. Нужна ли помощь с документами
-8. Имя клиента и компания, если этого ещё нет
-9. Номер телефона не спрашивай: WhatsApp-номер уже сохранён автоматически
+7. Для внутренних перевозок: нужна ли помощь с договором, счётом, заявкой и сопроводительными документами
+8. Для экспортных перевозок: нужна ли помощь с экспортными документами
+9. Имя клиента и компания, если этого ещё нет
+10. Номер телефона не спрашивай: WhatsApp-номер уже сохранён автоматически
 
 Маршруты и сроки справочно:
+- Внутри Казахстана: срок зависит от станции отправления, станции назначения, наличия вагона и графика движения; точный срок определяется после проверки.
 - Казахстан → Узбекистан: 3–5 суток
 - Казахстан → Таджикистан: 5–8 суток
 - Казахстан → Афганистан: 10–18 суток
 
+Если маршрут внутренний по Казахстану, отвечай так:
+"Понял, это внутренняя перевозка по Казахстану. Для точного расчёта нужны станция/город отправления, станция/город назначения, груз, вес, тип вагона и желаемая дата отправки."
+
 Типы вагонов:
-- Крытый вагон: 60–68 тонн, подходит для зерна в мешках, сахара, масла в упаковке
+- Крытый вагон: 60–68 тонн, подходит для зерна в мешках, сахара, масла в упаковке, тарных и паллетированных грузов
 - Хоппер/зерновоз: 60–75 тонн, подходит для пшеницы, ячменя, кукурузы и других сыпучих грузов
-- Платформа: подходит для паллет, оборудования и нестандартных грузов
+- Платформа: подходит для паллет, оборудования, техники и нестандартных грузов
+- Контейнер: подходит для отдельных видов тарных, сборных и контейнерных грузов
 
 Документы справочно:
+Для внутренних перевозок по Казахстану:
+- не говори про СТ-1 и экспортную декларацию как обязательные документы;
+- уточняй только, нужна ли помощь с договором, счётом, заявкой и сопроводительными документами;
+- если груз специфический, скажи, что требования по документам уточняются после проверки груза и маршрута.
+
+Для экспортных перевозок:
 - СТ-1 — сертификат происхождения, часто требуется для Узбекистана и Таджикистана
-- Фитосанитарный сертификат — нужен для зерновых и масличных культур
+- Фитосанитарный сертификат может потребоваться для зерновых и масличных грузов
 - ТН ВЭД справочно: пшеница 1001, ячмень 1003, сахар 1701, масло подсолнечное 1512
 - Экспортную декларацию оформляет таможенный брокер
 - Инвойс и счёт-фактура готовятся по данным клиента
 
-Передача менеджеру:
+Оформление заявки:
 Когда клиент указал груз, маршрут, вес или просит расчёт, не проси номер телефона повторно.
-Напиши естественно:
-"Понял, данные для предварительной заявки уже есть. Ваш WhatsApp-номер сохранён, поэтому менеджер сможет связаться с вами напрямую. Напишите, пожалуйста, ваше имя и компанию — передам заявку на точный расчёт."
+Не говори "передам менеджеру" и "менеджер свяжется".
+Говори от первого лица как менеджер.
 
-Если клиент уже написал имя и компанию, ответь:
-"Спасибо, заявку передаю менеджеру. Он проверит тариф, наличие подходящего вагона и свяжется с вами для точного расчёта."
+Если не хватает имени и компании, напиши естественно:
+"Понял, основные данные для расчёта уже есть. Ваш WhatsApp-номер сохранён. Напишите, пожалуйста, ваше имя и компанию — я зафиксирую заявку и подготовлю расчёт."
 
-Рабочее время менеджера:
+Если имя и компания уже есть, ответь:
+"Спасибо, заявку зафиксировал. Проверю тариф, наличие подходящего вагона и подготовлю точный расчёт по вашему маршруту."
+
+Если клиент просит договор или оформление, ответь:
+"Хорошо, оформляю заявку. По вашему маршруту проверю тариф, наличие вагона и подготовлю данные для договора."
+
+Рабочее время:
 09:00–18:00, Алматы.
 `.trim();
 }
@@ -790,10 +1337,10 @@ function getUnsupportedTypeReply(lang = "ru") {
 
 function getHandoffReply(lang = "ru") {
   const texts = {
-    ru: "Понял, передаю заявку менеджеру. Ваш WhatsApp-номер уже сохранён, повторно его писать не нужно. Напишите, пожалуйста, только ваше имя и компанию, чтобы менеджер быстрее подготовил расчёт.",
-    kz: "Түсіндім, өтінімді менеджерге беремін. WhatsApp-нөміріңіз сақталды, оны қайта жазудың қажеті жоқ. Есептеуді тездету үшін атыңыз бен компанияңызды жазыңыз.",
-    uz: "Tushundim, arizani menejerga yo'naltiraman. WhatsApp raqamingiz saqlandi, uni qayta yozish shart emas. Hisob-kitobni tezlashtirish uchun ismingiz va kompaniyangizni yozing.",
-    tj: "Фаҳмидам, дархостро ба менеҷер мерасонам. Рақами WhatsApp-и шумо сабт шуд, дубора навиштан лозим нест. Барои тезтар омода кардани ҳисоб, ном ва ширкататонро нависед.",
+    ru: "Понял, беру заявку в работу. Ваш WhatsApp-номер уже сохранён, повторно его писать не нужно. Напишите, пожалуйста, только ваше имя и компанию — зафиксирую данные и подготовлю расчёт.",
+    kz: "Түсіндім, өтінімді жұмысқа алдым. WhatsApp-нөміріңіз сақталды, оны қайта жазудың қажеті жоқ. Есептеуді дайындау үшін атыңыз бен компанияңызды жазыңыз.",
+    uz: "Tushundim, arizani ishga oldim. WhatsApp raqamingiz saqlandi, uni qayta yozish shart emas. Hisob-kitobni tayyorlash uchun ismingiz va kompaniyangizni yozing.",
+    tj: "Фаҳмидам, дархостро ба кор гирифтам. Рақами WhatsApp-и шумо сабт шуд, дубора навиштан лозим нест. Барои омода кардани ҳисоб, ном ва ширкататонро нависед.",
   };
 
   return texts[lang] || texts.ru;
@@ -802,7 +1349,7 @@ function getHandoffReply(lang = "ru") {
 function fallbackReply(lang = "ru") {
   const texts = {
     ru:
-      "Спасибо, сообщение получил. Могу принять вашу заявку и передать менеджеру.\n\n" +
+      "Спасибо, сообщение получил. Могу зафиксировать заявку и подготовить её к расчёту.\n\n" +
       "Напишите, пожалуйста:\n" +
       "1. Какой груз нужно перевезти?\n" +
       "2. Откуда и куда?\n" +
@@ -812,7 +1359,7 @@ function fallbackReply(lang = "ru") {
       "WhatsApp-номер уже сохранён, повторно его писать не нужно.",
 
     kz:
-      "Хабарыңызды алдым. Өтінімді қабылдап, менеджерге бере аламын.\n\n" +
+      "Хабарыңызды алдым. Өтінімді тіркеп, есептеуге дайындай аламын.\n\n" +
       "Жазыңыз, өтінемін:\n" +
       "1. Қандай жүк тасымалдау керек?\n" +
       "2. Қайдан және қайда?\n" +
@@ -822,7 +1369,7 @@ function fallbackReply(lang = "ru") {
       "WhatsApp-нөміріңіз сақталды, қайта жазудың қажеті жоқ.",
 
     uz:
-      "Xabaringizni oldim. Arizangizni qabul qilib, menejerga yubora olaman.\n\n" +
+      "Xabaringizni oldim. Arizangizni qayd qilib, hisob-kitobga tayyorlay olaman.\n\n" +
       "Iltimos, yozing:\n" +
       "1. Qanday yuk tashish kerak?\n" +
       "2. Qayerdan va qayerga?\n" +
@@ -832,7 +1379,7 @@ function fallbackReply(lang = "ru") {
       "WhatsApp raqamingiz saqlandi, uni qayta yozish shart emas.",
 
     tj:
-      "Паёматонро гирифтам. Метавонам дархостро қабул карда, ба менеҷер расонам.\n\n" +
+      "Паёматонро гирифтам. Метавонам дархостро сабт карда, барои ҳисоб омода кунам.\n\n" +
       "Лутфан нависед:\n" +
       "1. Кадом борро интиқол додан лозим?\n" +
       "2. Аз куҷо ва ба куҷо?\n" +
