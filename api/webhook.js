@@ -3,27 +3,29 @@
 // Vercel API Route: /api/webhook.js
 // Компания: ж/д грузоперевозки, экспорт из Казахстана
 // ИИ: Claude → Gemini → fallback
-// CRM: CRM_WEBHOOK_URL / AmoCRM webhook / Make / n8n
+// CRM: CRM_WEBHOOK_URL / AMOCRM_WEBHOOK_URL / Make / n8n / webhook.site
 // ============================================================
 
-const VERIFY_TOKEN      = process.env.VERIFY_TOKEN;
-const WHATSAPP_TOKEN    = process.env.WHATSAPP_TOKEN;
-const PHONE_NUMBER_ID   = process.env.PHONE_NUMBER_ID;
+const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
+const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
+const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
-const GEMINI_API_KEY    = process.env.GEMINI_API_KEY;
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
-const CRM_WEBHOOK_URL   = process.env.CRM_WEBHOOK_URL;
+const CRM_WEBHOOK_URL =
+  process.env.CRM_WEBHOOK_URL || process.env.AMOCRM_WEBHOOK_URL;
 
 const GRAPH_API_VERSION = process.env.GRAPH_API_VERSION || "v25.0";
 
-const CLAUDE_MODEL = process.env.CLAUDE_MODEL || "claude-sonnet-4-20250514";
-const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash-lite";
+const CLAUDE_MODEL =
+  process.env.CLAUDE_MODEL || "claude-sonnet-4-20250514";
+
+const GEMINI_MODEL =
+  process.env.GEMINI_MODEL || "gemini-2.5-flash-lite";
 
 // ============================================================
 // Память диалогов
-// Важно: на Vercel память может сбрасываться при рестарте.
-// Для продакшена лучше Redis / Vercel KV / Supabase / Firebase.
 // ============================================================
 
 const conversationStore = new Map();
@@ -39,8 +41,8 @@ const MAX_HISTORY_TURNS = 10;
 export default async function handler(req, res) {
   try {
     if (req.method === "GET") {
-      const mode      = req.query["hub.mode"];
-      const token     = req.query["hub.verify_token"];
+      const mode = req.query["hub.mode"];
+      const token = req.query["hub.verify_token"];
       const challenge = req.query["hub.challenge"];
 
       if (mode === "subscribe" && token === VERIFY_TOKEN) {
@@ -57,7 +59,6 @@ export default async function handler(req, res) {
     }
 
     return res.status(405).send("Method Not Allowed");
-
   } catch (error) {
     console.error("Webhook handler error:", error);
     return res.status(200).send("EVENT_RECEIVED");
@@ -79,7 +80,6 @@ async function handleIncomingWebhook(req) {
       return;
     }
 
-    // Игнорируем статусы доставки / прочтения
     if (value.statuses) {
       console.log("Status event ignored");
       return;
@@ -101,14 +101,10 @@ async function handleIncomingWebhook(req) {
       return;
     }
 
-    // Имя из WhatsApp-профиля, если Meta его передала
-    const contactName =
-      value.contacts?.[0]?.profile?.name ||
-      "";
+    const contactName = value.contacts?.[0]?.profile?.name || "";
 
     console.log(`[CONTACT] phone=${from} name="${contactName}"`);
 
-    // Защита от дублей
     if (messageId && processedMessages.has(messageId)) {
       console.log(`Duplicate message ignored: ${messageId}`);
       return;
@@ -128,12 +124,8 @@ async function handleIncomingWebhook(req) {
     session.whatsappPhone = from;
     session.whatsappName = contactName || session.whatsappName || "";
 
-    // Пока обрабатываем только текст
     if (message.type !== "text") {
-      await sendWhatsAppMessage(
-        from,
-        getUnsupportedTypeReply(session.lang)
-      );
+      await sendWhatsAppMessage(from, getUnsupportedTypeReply(session.lang));
       return;
     }
 
@@ -146,14 +138,37 @@ async function handleIncomingWebhook(req) {
 
     console.log(`[IN] from=${from} text="${userText}"`);
 
-    // Определяем язык только в начале диалога
     if (session.messages.length === 0) {
       session.lang = detectLanguage(userText);
     }
 
     appendToHistory(from, "user", userText);
 
-    // Если клиент просит живого менеджера
+    // ========================================================
+    // РУЧНОЙ ТЕСТ CRM
+    // Напишите боту: тест crm
+    // ========================================================
+
+    if (/^тест\s*crm$/i.test(userText) || /^test\s*crm$/i.test(userText)) {
+      console.log("[CRM_TEST] Manual CRM test started");
+
+      markLeadHot(from);
+
+      const sentToCrm = await notifyCRM(from, session, "manual_crm_test");
+
+      const reply = sentToCrm
+        ? "Тест CRM выполнен: заявка отправлена в webhook. Проверьте webhook.site — должен появиться POST."
+        : "Тест CRM не прошёл. Проверьте Vercel Logs: возможно, CRM_WEBHOOK_URL не указан или webhook вернул ошибку.";
+
+      appendToHistory(from, "assistant", reply);
+      await sendWhatsAppMessage(from, reply);
+      return;
+    }
+
+    // ========================================================
+    // Если клиент просит менеджера / договор / контракт
+    // ========================================================
+
     if (wantsHumanAgent(userText)) {
       const reply = getHandoffReply(session.lang);
 
@@ -161,6 +176,7 @@ async function handleIncomingWebhook(req) {
       markLeadHot(from);
 
       const sentToCrm = await notifyCRM(from, session, "human_handoff");
+
       if (sentToCrm) {
         session.crmNotified = true;
       }
@@ -169,13 +185,35 @@ async function handleIncomingWebhook(req) {
       return;
     }
 
+    // ========================================================
+    // AI-ответ
+    // ========================================================
+
     const aiReply = await askAI(session);
 
     appendToHistory(from, "assistant", aiReply);
+
     updateLeadScore(from, userText);
 
-    if (session.leadScore >= 3 && !session.crmNotified) {
-      const sentToCrm = await notifyCRM(from, session, "hot_lead");
+    const aiSaysHandoff =
+      /передаю.*заявк|передать.*заявк|заявк.*переда|передаю.*менеджер|менеджер.*свяжется|точн.*расч[её]т|оформ.*заявк|проверит тариф|наличие.*вагон/i.test(
+        aiReply
+      );
+
+    console.log("[CRM_CHECK]", {
+      phone: from,
+      leadScore: session.leadScore,
+      aiSaysHandoff,
+      crmNotified: session.crmNotified,
+      hasCrmUrl: Boolean(CRM_WEBHOOK_URL),
+    });
+
+    if ((session.leadScore >= 3 || aiSaysHandoff) && !session.crmNotified) {
+      const sentToCrm = await notifyCRM(
+        from,
+        session,
+        "hot_lead_or_ai_handoff"
+      );
 
       if (sentToCrm) {
         session.crmNotified = true;
@@ -183,7 +221,6 @@ async function handleIncomingWebhook(req) {
     }
 
     await sendWhatsAppMessage(from, aiReply);
-
   } catch (error) {
     console.error("Webhook processing error:", error);
   }
@@ -194,16 +231,20 @@ async function handleIncomingWebhook(req) {
 // ============================================================
 
 async function askAI(session) {
-  console.log("[AI] Trying Claude...");
+  if (ANTHROPIC_API_KEY) {
+    console.log("[AI] Trying Claude...");
 
-  const claudeReply = await askClaude(session);
+    const claudeReply = await askClaude(session);
 
-  if (claudeReply) {
-    console.log("[AI_PROVIDER] Claude");
-    return claudeReply;
+    if (claudeReply) {
+      console.log("[AI_PROVIDER] Claude");
+      return claudeReply;
+    }
+
+    console.warn("[AI] Claude unavailable. Trying Gemini...");
+  } else {
+    console.log("[AI] Claude key missing. Skipping Claude.");
   }
-
-  console.warn("[AI] Claude unavailable. Trying Gemini...");
 
   const geminiReply = await askGemini(session);
 
@@ -222,7 +263,6 @@ async function askAI(session) {
 
 async function askClaude(session) {
   if (!ANTHROPIC_API_KEY) {
-    console.error("ANTHROPIC_API_KEY is missing");
     return null;
   }
 
@@ -253,7 +293,6 @@ async function askClaude(session) {
     const reply = data.content?.[0]?.text?.trim();
 
     return reply ? limitWhatsAppText(cleanReply(reply)) : null;
-
   } catch (error) {
     console.error("Claude request failed:", error);
     return null;
@@ -331,7 +370,6 @@ async function askGemini(session) {
     const reply = data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
 
     return reply ? limitWhatsAppText(cleanReply(reply)) : null;
-
   } catch (error) {
     console.error("Gemini request failed:", error);
     return null;
@@ -390,7 +428,6 @@ function getOrCreateSession(phone) {
     };
 
     conversationStore.set(phone, session);
-
   } else {
     session.lastTs = now;
   }
@@ -418,7 +455,6 @@ function appendToHistory(phone, role, content) {
 
 // ============================================================
 // Определение языка
-// ru / kz / uz / tj
 // ============================================================
 
 function detectLanguage(text) {
@@ -426,21 +462,27 @@ function detectLanguage(text) {
 
   if (
     /[әіңғүұқөһ]/.test(lower) ||
-    /\b(сәлем|рахмет|қайда|жүк|вагон|қанша|жіберу|баға|мерзім|керек)\b/.test(lower)
+    /\b(сәлем|рахмет|қайда|жүк|вагон|қанша|жіберу|баға|мерзім|керек)\b/.test(
+      lower
+    )
   ) {
     return "kz";
   }
 
   if (
     /[ʻʼ]/.test(text) ||
-    /\b(salom|rahmat|qayerda|narx|yuk|vagon|jo'natish|xizmat|kerak)\b/.test(lower)
+    /\b(salom|rahmat|qayerda|narx|yuk|vagon|jo'natish|xizmat|kerak)\b/.test(
+      lower
+    )
   ) {
     return "uz";
   }
 
   if (
     /[ӣғқҳҷ]/.test(lower) ||
-    /\b(салом|рахмат|куҷо|нарх|бор|вагон|фиристодан|хизмат|лозим)\b/.test(lower)
+    /\b(салом|рахмат|куҷо|нарх|бор|вагон|фиристодан|хизмат|лозим)\b/.test(
+      lower
+    )
   ) {
     return "tj";
   }
@@ -455,7 +497,9 @@ function detectLanguage(text) {
 function wantsHumanAgent(text) {
   const lower = text.toLowerCase();
 
-  return /\b(менеджер|оператор|человек|живой|хочу позвонить|соедини|перезвони|мне нужен человек|не с ботом|не бот|свяжитесь|позвоните|договор|контракт)\b/.test(lower);
+  return /\b(менеджер|оператор|человек|живой|хочу позвонить|соедини|перезвони|мне нужен человек|не с ботом|не бот|свяжитесь|позвоните|договор|контракт)\b/.test(
+    lower
+  );
 }
 
 // ============================================================
@@ -469,31 +513,45 @@ function updateLeadScore(phone, userText) {
 
   const lower = userText.toLowerCase();
 
-  if (/\b(цена|стоимость|сколько стоит|тариф|расчет|расчёт|посчитай)\b/.test(lower)) {
-    session.leadScore++;
+  let added = 0;
+
+  if (
+    /\b(цена|стоимость|сколько стоит|тариф|расчет|расчёт|посчитай)\b/.test(
+      lower
+    )
+  ) {
+    added++;
   }
 
-  if (/\b(маршрут|откуда|куда|направление|станция|алматы|ташкент|душанбе|афганистан|узбекистан|таджикистан)\b/.test(lower)) {
-    session.leadScore++;
+  if (
+    /\b(маршрут|откуда|куда|направление|станция|алматы|ташкент|душанбе|афганистан|узбекистан|таджикистан)\b/.test(
+      lower
+    )
+  ) {
+    added++;
   }
 
   if (/\b(вагон|контейнер|хоппер|крытый|платформа|зерновоз)\b/.test(lower)) {
-    session.leadScore++;
+    added++;
   }
 
-  if (/\b(контракт|договор|заявка|оформить|отправить|перевезти)\b/.test(lower)) {
-    session.leadScore++;
+  if (
+    /\b(контракт|договор|заявка|оформить|отправить|перевезти)\b/.test(lower)
+  ) {
+    added++;
   }
 
   if (/\b(срочно|срочная|быстро|сегодня|завтра|дата отправки)\b/.test(lower)) {
-    session.leadScore++;
+    added++;
   }
 
   if (/\b(тонн|тонна|кг|кило|объем|объём|вес|кубов)\b/.test(lower)) {
-    session.leadScore++;
+    added++;
   }
 
-  console.log(`[LEAD] phone=${phone} score=${session.leadScore}`);
+  session.leadScore += added;
+
+  console.log(`[LEAD] phone=${phone} added=${added} score=${session.leadScore}`);
 }
 
 function markLeadHot(phone) {
@@ -505,13 +563,10 @@ function markLeadHot(phone) {
 }
 
 // ============================================================
-// CRM / AmoCRM / Make / n8n webhook
+// CRM / AmoCRM / Make / n8n / webhook.site
 // ============================================================
 
 async function notifyCRM(phone, session, reason = "lead") {
-  const CRM_WEBHOOK_URL =
-    process.env.CRM_WEBHOOK_URL || process.env.AMOCRM_WEBHOOK_URL;
-
   const summary = session.messages
     .filter((m) => m.role === "user")
     .map((m) => m.content)
@@ -531,7 +586,9 @@ async function notifyCRM(phone, session, reason = "lead") {
   };
 
   console.log(
-    `[CRM] HOT LEAD phone=${phone} score=${session.leadScore} hasCrmUrl=${Boolean(CRM_WEBHOOK_URL)}`
+    `[CRM] HOT LEAD phone=${phone} score=${session.leadScore} reason=${reason} hasCrmUrl=${Boolean(
+      CRM_WEBHOOK_URL
+    )}`
   );
 
   if (!CRM_WEBHOOK_URL) {
@@ -618,7 +675,7 @@ function getSystemPrompt(session = {}) {
 - сначала кратко подтверди, что понял запрос;
 - используй детали клиента: груз, маршрут, вес, дату, тип вагона;
 - задавай только 1–2 уточняющих вопроса за раз;
-- не используй Markdown: никаких **, ##, таблиц;
+- не используй Markdown;
 - не давай точных цен без проверки маршрута, веса, груза, даты и наличия вагона;
 - не гарантируй наличие вагонов без проверки менеджером;
 - не спрашивай номер телефона повторно;
@@ -711,7 +768,6 @@ async function sendWhatsAppMessage(to, body) {
 
     console.log(`[OUT] sent to=${to} len=${body.length}`);
     console.log("[OUT_META]", JSON.stringify(data));
-
   } catch (error) {
     console.error("sendWhatsAppMessage failed:", error);
   }
