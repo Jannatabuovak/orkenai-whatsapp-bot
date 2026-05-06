@@ -18,6 +18,9 @@ const CRM_WEBHOOK_URL   = process.env.CRM_WEBHOOK_URL || process.env.AMOCRM_WEBH
 const EXCEL_WEBHOOK_URL = process.env.EXCEL_WEBHOOK_URL || process.env.GOOGLE_SHEETS_WEBHOOK_URL;
 const EXCEL_SECRET      = process.env.EXCEL_SECRET || "";
 
+const MANAGER_PHONE_DOCS  = process.env.MANAGER_PHONE_DOCS  || "87714041276"; // документы
+const MANAGER_PHONE_CARGO = process.env.MANAGER_PHONE_CARGO || "87777266948"; // остальное
+
 const GRAPH_API_VERSION = process.env.GRAPH_API_VERSION || "v25.0";
 
 const CLAUDE_MODEL = process.env.CLAUDE_MODEL || "claude-sonnet-4-20250514";
@@ -390,6 +393,7 @@ async function processUserText(from, session, userText) {
     await saveToExcel(from, session, "lead", { userText, aiReply: reply, reason: "human_callback_request" });
     await notifyCRM(from, session, "human_callback_request");
     session.crmNotified = true;
+    await notifyManager(from, session, "human_callback_request", userText);
     await sendWhatsAppMessage(from, reply);
     return;
   }
@@ -410,6 +414,8 @@ async function processUserText(from, session, userText) {
 
     const sentToCrm = await notifyCRM(from, session, "hot_lead");
     if (sentToCrm) session.crmNotified = true;
+
+    await notifyManager(from, session, "hot_lead", userText);
   }
 
   await sendWhatsAppMessage(from, aiReply);
@@ -708,7 +714,7 @@ function fillKnownCityRoute(session, lower) {
     ["афганистан",      "Афганистан"],
     ["узбекистан",      "Узбекистан"],
     ["таджикистан",     "Таджикистан"],
-    ["мazar",           "Мазари-Шариф"],
+    ["mazar",           "Мазари-Шариф"],
     ["мазари-шариф",    "Мазари-Шариф"],
     ["хайратон",        "Хайратон"],
     ["термез",          "Термез"],
@@ -828,6 +834,67 @@ function detectLanguage(text) {
 
 function wantsHumanAgent(text) {
   return /\b(оператор|человек|живой|хочу позвонить|соедини|перезвони|мне нужен человек|не с ботом|не бот|свяжитесь|позвоните|адам|тірі|қоңырау)\b/i.test(text);
+}
+
+// ============================================================
+// Определение темы — документы или перевозка
+// ============================================================
+
+function isDocumentationRequest(session, userText = "") {
+  const lower = userText.toLowerCase();
+
+  const lastMessages = session.messages
+    .slice(-6)
+    .map((m) => m.content.toLowerCase())
+    .join(" ");
+
+  const docKeywords = /\b(документ|ст-1|ст1|фито|фитосанитар|сертификат|деклараци|инвойс|тн\s*вэд|разрешени|лицензи|таможн|оформлени|бумаг|накладн|акт|договор|контракт|счёт|счет\s+факт)\b/;
+
+  return (
+    docKeywords.test(lower) ||
+    docKeywords.test(lastMessages) ||
+    session.leadData?.documentsHelp === "нужна помощь с документами"
+  );
+}
+
+// ============================================================
+// Уведомление менеджера в WhatsApp
+// ============================================================
+
+async function notifyManager(phone, session, reason = "hot_lead", userText = "") {
+  if (!WHATSAPP_TOKEN || !PHONE_NUMBER_ID) return;
+
+  const data = session.leadData || {};
+  const name = data.clientName || session.whatsappName || "не указано";
+
+  const isDoc       = isDocumentationRequest(session, userText);
+  const targetPhone = isDoc ? MANAGER_PHONE_DOCS : MANAGER_PHONE_CARGO;
+  const topicLabel  = isDoc ? "📋 Вопрос по документам" : "🚂 Грузоперевозка";
+
+  const lines = [
+    `🔔 Новая заявка (${reason})`,
+    `${topicLabel}`,
+    ``,
+    `👤 Клиент:  ${name}`,
+    data.company    ? `🏢 Компания:  ${data.company}`         : null,
+    `📞 Телефон: +${phone}`,
+    `🌐 Язык:    ${session.lang || "ru"}`,
+    ``,
+    `📦 Груз:       ${data.cargo         || "—"}`,
+    `📍 Откуда:     ${data.origin        || "—"}`,
+    `📍 Куда:       ${data.destination   || "—"}`,
+    `⚖️  Вес:        ${data.weight        || "—"}`,
+    `🚃 Вагон:      ${data.wagonType     || "—"}`,
+    `📅 Дата:       ${data.shippingDate  || "—"}`,
+    `📄 Документы:  ${data.documentsHelp || "—"}`,
+    ``,
+    `🏆 Score: ${session.leadScore || 0}`,
+  ]
+    .filter((l) => l !== null)
+    .join("\n");
+
+  await sendWhatsAppMessage(targetPhone, lines);
+  console.log(`[MANAGER_NOTIFY] Тема: ${topicLabel} → отправлено на ${targetPhone}`);
 }
 
 // ============================================================
