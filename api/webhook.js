@@ -130,6 +130,15 @@ async function handleIncomingWebhook(req) {
     session.whatsappPhone = from;
     session.whatsappName = contactName || session.whatsappName || "";
 
+    // ========================================================
+    // Обработка интерактивных кнопок и списков
+    // ========================================================
+
+    if (message.type === "interactive") {
+      await handleInteractiveReply(from, message, session);
+      return;
+    }
+
     if (message.type !== "text") {
       const reply = getUnsupportedTypeReply(session.lang);
 
@@ -305,6 +314,12 @@ async function handleIncomingWebhook(req) {
     }
 
     await sendWhatsAppMessage(from, aiReply);
+
+    // После первого ответа бота — показать главное меню кнопок
+    const assistantCount = session.messages.filter(m => m.role === "assistant").length;
+    if (assistantCount === 1) {
+      await sendWelcomeButtons(from, session.lang);
+    }
   } catch (error) {
     console.error("Webhook processing error:", error);
   }
@@ -1267,6 +1282,521 @@ function getSystemPrompt(session = {}) {
 Рабочее время:
 09:00–18:00, Алматы.
 `.trim();
+}
+
+// ============================================================
+// Интерактивные кнопки: приветственное меню
+// ============================================================
+
+async function sendWelcomeButtons(to, lang = "ru") {
+  const texts = {
+    ru: {
+      body: "Выберите раздел — отвечу быстро и по делу:",
+      wagons: "🚂 Вагоны и тарифы",
+      routes: "🌍 Маршруты и сроки",
+      docs:   "📋 Документы",
+    },
+    kz: {
+      body: "Бөлімді таңдаңыз — жылдам жауап беремін:",
+      wagons: "🚂 Вагон және тариф",
+      routes: "🌍 Бағыт және мерзім",
+      docs:   "📋 Құжаттар",
+    },
+    uz: {
+      body: "Bo'limni tanlang — tez javob beraman:",
+      wagons: "🚂 Vagon va tariflar",
+      routes: "🌍 Yo'nalish va muddatlar",
+      docs:   "📋 Hujjatlar",
+    },
+    tj: {
+      body: "Бахшро интихоб кунед — зуд ҷавоб медиҳам:",
+      wagons: "🚂 Вагон ва тарифҳо",
+      routes: "🌍 Масир ва мӯҳлатҳо",
+      docs:   "📋 Ҳуҷҷатҳо",
+    },
+  };
+
+  const t = texts[lang] || texts.ru;
+
+  await sendInteractiveButtons(to, t.body, [
+    { id: "menu_wagons", title: t.wagons },
+    { id: "menu_routes", title: t.routes },
+    { id: "menu_docs",   title: t.docs },
+  ]);
+}
+
+// ============================================================
+// Обработка нажатий кнопок и выбора из списка
+// ============================================================
+
+async function handleInteractiveReply(from, message, session) {
+  try {
+    const btnReply  = message.interactive?.button_reply;
+    const listReply = message.interactive?.list_reply;
+
+    const replyId    = btnReply?.id    || listReply?.id    || "";
+    const replyTitle = btnReply?.title || listReply?.title || "";
+
+    console.log(`[INTERACTIVE] from=${from} id="${replyId}" title="${replyTitle}"`);
+
+    // ── Главные категории ──────────────────────────────────
+    if (replyId === "menu_wagons") {
+      await sendWagonList(from, session.lang);
+      return;
+    }
+
+    if (replyId === "menu_routes") {
+      await sendRouteList(from, session.lang);
+      return;
+    }
+
+    if (replyId === "menu_docs") {
+      await sendDocsList(from, session.lang);
+      return;
+    }
+
+    // ── Кнопка «Рассчитать тариф» ──────────────────────────
+    if (replyId === "btn_calculate") {
+      const text = {
+        ru: "Хочу рассчитать тариф на перевозку",
+        kz: "Тасымал тарифін есептегім келеді",
+        uz: "Tashish tarifini hisoblashni xohlayman",
+        tj: "Мехоҳам тарифи интиқолро ҳисоб кунам",
+      }[session.lang] || "Хочу рассчитать тариф на перевозку";
+
+      appendToHistory(from, "user", text);
+      const aiReply = await askAI(session);
+      appendToHistory(from, "assistant", aiReply);
+      await sendWhatsAppMessage(from, aiReply);
+      return;
+    }
+
+    // ── Быстрые FAQ-ответы ─────────────────────────────────
+    const faqAnswer = getQuickFaqAnswer(replyId, session.lang);
+
+    if (faqAnswer) {
+      appendToHistory(from, "user", replyTitle);
+      appendToHistory(from, "assistant", faqAnswer);
+
+      await saveToExcel(from, session, "faq_reply", {
+        userText: replyTitle,
+        aiReply: faqAnswer,
+        reason: replyId,
+      });
+
+      await sendWhatsAppMessage(from, faqAnswer);
+
+      // После FAQ-ответа — предложить рассчитать тариф
+      const calcLabel = {
+        ru: "📊 Рассчитать тариф",
+        kz: "📊 Тариф есептеу",
+        uz: "📊 Tarifni hisoblash",
+        tj: "📊 Ҳисоби тариф",
+      }[session.lang] || "📊 Рассчитать тариф";
+
+      const menuLabel = {
+        ru: "↩ Главное меню",
+        kz: "↩ Басты мәзір",
+        uz: "↩ Asosiy menyu",
+        tj: "↩ Менюи асосӣ",
+      }[session.lang] || "↩ Главное меню";
+
+      await sendInteractiveButtons(from,
+        { ru: "Что хотите сделать дальше?", kz: "Әрі қарай не жасайсыз?", uz: "Keyingi qadam?", tj: "Баъд чӣ?" }[session.lang] || "Что дальше?",
+        [
+          { id: "btn_calculate", title: calcLabel },
+          { id: "menu_back",     title: menuLabel },
+        ]
+      );
+      return;
+    }
+
+    // ── Возврат в главное меню ──────────────────────────────
+    if (replyId === "menu_back") {
+      await sendWelcomeButtons(from, session.lang);
+      return;
+    }
+
+    // ── Неизвестная кнопка — пустить через AI ──────────────
+    appendToHistory(from, "user", replyTitle);
+    const aiReply = await askAI(session);
+    appendToHistory(from, "assistant", aiReply);
+    await sendWhatsAppMessage(from, aiReply);
+
+  } catch (error) {
+    console.error("handleInteractiveReply error:", error);
+  }
+}
+
+// ============================================================
+// Список вопросов: Вагоны и тарифы
+// ============================================================
+
+async function sendWagonList(to, lang = "ru") {
+  const body = {
+    ru: "Выберите вопрос о вагонах:",
+    kz: "Вагон туралы сұрақты таңдаңыз:",
+    uz: "Vagon haqida savol tanlang:",
+    tj: "Саволро дар бораи вагон интихоб кунед:",
+  }[lang] || "Выберите вопрос о вагонах:";
+
+  const btn = {
+    ru: "Открыть список", kz: "Тізімді ашу", uz: "Ro'yxatni ochish", tj: "Рӯйхатро кушоед",
+  }[lang] || "Открыть список";
+
+  await sendInteractiveList(to, body, btn, [
+    {
+      title: { ru: "Стоимость и вместимость", kz: "Баға және сыйымдылық", uz: "Narx va sig'im", tj: "Нарх ва иқтидор" }[lang] || "Стоимость и вместимость",
+      rows: [
+        { id: "faq_wagon_price",    title: { ru: "💰 Цена жабық вагона",      kz: "💰 Жабық вагон бағасы",   uz: "💰 Yopiq vagon narxi",       tj: "💰 Нархи вагони пӯшида"  }[lang] || "💰 Цена вагона" },
+        { id: "faq_wagon_capacity", title: { ru: "📦 Вместимость вагона",      kz: "📦 Вагонның сыйымдылығы", uz: "📦 Vagon sig'imi",            tj: "📦 Иқтидори вагон"       }[lang] || "📦 Вместимость" },
+        { id: "faq_wagon_types",    title: { ru: "🚃 Типы вагонов",            kz: "🚃 Вагон түрлері",         uz: "🚃 Vagon turlari",           tj: "🚃 Намудҳои вагон"       }[lang] || "🚃 Типы вагонов" },
+      ],
+    },
+    {
+      title: { ru: "Бронирование и оплата", kz: "Брондау және төлем", uz: "Bron va to'lov", tj: "Бронирование ва пардохт" }[lang] || "Бронирование и оплата",
+      rows: [
+        { id: "faq_wagon_booking",  title: { ru: "📅 Нужно ли бронировать?",  kz: "📅 Алдын ала брондау?",   uz: "📅 Oldindan bron kerakmi?",  tj: "📅 Оё бронирование лозим?" }[lang] || "📅 Бронирование" },
+        { id: "faq_payment",        title: { ru: "💳 Порядок оплаты",          kz: "💳 Төлем тәртібі",         uz: "💳 To'lov tartibi",          tj: "💳 Тартиби пардохт"      }[lang] || "💳 Оплата" },
+        { id: "faq_min_order",      title: { ru: "📏 Минимальный объём",       kz: "📏 Ең аз тапсырыс",        uz: "📏 Minimal hajm",            tj: "📏 Ҳаҷми ҳадди аққал"   }[lang] || "📏 Мин. объём" },
+      ],
+    },
+  ]);
+}
+
+// ============================================================
+// Список вопросов: Маршруты и сроки
+// ============================================================
+
+async function sendRouteList(to, lang = "ru") {
+  const body = {
+    ru: "Выберите направление или вопрос:",
+    kz: "Бағытты немесе сұрақты таңдаңыз:",
+    uz: "Yo'nalish yoki savolni tanlang:",
+    tj: "Масир ё саволро интихоб кунед:",
+  }[lang] || "Выберите направление:";
+
+  const btn = {
+    ru: "Открыть список", kz: "Тізімді ашу", uz: "Ro'yxatni ochish", tj: "Рӯйхатро кушоед",
+  }[lang] || "Открыть список";
+
+  await sendInteractiveList(to, body, btn, [
+    {
+      title: { ru: "Сроки доставки", kz: "Жеткізу мерзімдері", uz: "Yetkazish muddatlari", tj: "Мӯҳлатҳои расонидан" }[lang] || "Сроки доставки",
+      rows: [
+        { id: "faq_route_kz_uz", title: { ru: "🇺🇿 КЗ → Узбекистан (срок)",    kz: "🇺🇿 ҚЗ → Өзбекстан (мерзім)",   uz: "🇺🇿 QZ → O'zbekiston (muddat)",  tj: "🇺🇿 ҚЗ → Ӯзбекистон (мӯҳлат)"  }[lang] || "🇺🇿 КЗ → Узбекистан" },
+        { id: "faq_route_kz_tj", title: { ru: "🇹🇯 КЗ → Таджикистан (срок)",   kz: "🇹🇯 ҚЗ → Тәжікстан (мерзім)",  uz: "🇹🇯 QZ → Tojikiston (muddat)",   tj: "🇹🇯 ҚЗ → Тоҷикистон (мӯҳлат)"  }[lang] || "🇹🇯 КЗ → Таджикистан" },
+        { id: "faq_route_kz_af", title: { ru: "🇦🇫 КЗ → Афганистан (срок)",   kz: "🇦🇫 ҚЗ → Ауғанстан (мерзім)",  uz: "🇦🇫 QZ → Afgʻoniston (muddat)", tj: "🇦🇫 ҚЗ → Афғонистон (мӯҳлат)"  }[lang] || "🇦🇫 КЗ → Афганистан" },
+      ],
+    },
+    {
+      title: { ru: "Логистика", kz: "Логистика", uz: "Logistika", tj: "Логистика" }[lang] || "Логистика",
+      rows: [
+        { id: "faq_stations",  title: { ru: "🏭 Станции загрузки",         kz: "🏭 Жүк тиеу станциялары",   uz: "🏭 Yuklash stansiyalari",       tj: "🏭 Истгоҳҳои боргирӣ"         }[lang] || "🏭 Станции загрузки" },
+        { id: "faq_tracking",  title: { ru: "📡 Отслеживание груза",        kz: "📡 Жүкті қадағалау",        uz: "📡 Yukni kuzatish",             tj: "📡 Пайгирии бор"              }[lang] || "📡 Отслеживание" },
+        { id: "faq_goods",     title: { ru: "📦 Какие товары везём",        kz: "📦 Қандай тауарлар?",       uz: "📦 Qanday tovarlar?",           tj: "📦 Кадом молҳо?"              }[lang] || "📦 Товары" },
+      ],
+    },
+  ]);
+}
+
+// ============================================================
+// Список вопросов: Документы
+// ============================================================
+
+async function sendDocsList(to, lang = "ru") {
+  const body = {
+    ru: "Выберите вопрос по документам:",
+    kz: "Құжаттар бойынша сұрақты таңдаңыз:",
+    uz: "Hujjatlar bo'yicha savol tanlang:",
+    tj: "Саволро оид ба ҳуҷҷатҳо интихоб кунед:",
+  }[lang] || "Выберите вопрос по документам:";
+
+  const btn = {
+    ru: "Открыть список", kz: "Тізімді ашу", uz: "Ro'yxatni ochish", tj: "Рӯйхатро кушоед",
+  }[lang] || "Открыть список";
+
+  await sendInteractiveList(to, body, btn, [
+    {
+      title: { ru: "Сертификаты и разрешения", kz: "Сертификаттар", uz: "Sertifikatlar", tj: "Сертификатҳо" }[lang] || "Сертификаты",
+      rows: [
+        { id: "faq_doc_st1",         title: { ru: "📜 СТ-1 сертификат",          kz: "📜 СТ-1 сертификаты",       uz: "📜 ST-1 sertifikati",          tj: "📜 Сертификати СТ-1"          }[lang] || "📜 СТ-1" },
+        { id: "faq_doc_phyto",       title: { ru: "🌿 Фитосанитарный сертификат", kz: "🌿 Фитосанитарлық сертификат", uz: "🌿 Fitosanitariya sertifikati", tj: "🌿 Гувоҳномаи фитосанитарӣ" }[lang] || "🌿 Фитосанитарный" },
+        { id: "faq_doc_quality",     title: { ru: "✅ Сертификат качества",       kz: "✅ Сапа сертификаты",       uz: "✅ Sifat sertifikati",         tj: "✅ Гувоҳномаи сифат"         }[lang] || "✅ Сертификат качества" },
+      ],
+    },
+    {
+      title: { ru: "Таможня и экспорт", kz: "Кеден және экспорт", uz: "Bojxona va eksport", tj: "Гумрук ва содирот" }[lang] || "Таможня и экспорт",
+      rows: [
+        { id: "faq_doc_declaration", title: { ru: "📋 Экспортная декларация",    kz: "📋 Экспорттық декларация",  uz: "📋 Eksport deklaratsiyasi",    tj: "📋 Декларацияи содиротӣ"     }[lang] || "📋 Экспортная декларация" },
+        { id: "faq_doc_tnved",       title: { ru: "🔢 ТН ВЭД коды",             kz: "🔢 ТН СЭҚ кодтары",        uz: "🔢 TN VED kodlari",            tj: "🔢 Рамзҳои ТН ВЭД"          }[lang] || "🔢 ТН ВЭД" },
+        { id: "faq_doc_customs",     title: { ru: "🏛 Таможенное оформление",    kz: "🏛 Кедендік рәсімдеу",      uz: "🏛 Bojxona rasmiylashuvi",     tj: "🏛 Расмикунонии гумрукӣ"     }[lang] || "🏛 Таможня" },
+      ],
+    },
+    {
+      title: { ru: "Договор и счета", kz: "Шарт және шот", uz: "Shartnoma va hisob", tj: "Шартнома ва ҳисоб" }[lang] || "Договор и счета",
+      rows: [
+        { id: "faq_doc_contract",    title: { ru: "🤝 Контракт и инвойс",        kz: "🤝 Контракт және инвойс",   uz: "🤝 Kontrakt va invoice",       tj: "🤝 Шартнома ва инвойс"       }[lang] || "🤝 Контракт" },
+        { id: "faq_doc_packaging",   title: { ru: "📦 Требования к упаковке",    kz: "📦 Қаптама талаптары",      uz: "📦 Qadoqlash talablari",       tj: "📦 Талабот ба бастабандӣ"    }[lang] || "📦 Упаковка" },
+        { id: "faq_doc_time",        title: { ru: "⏱ Срок оформления",          kz: "⏱ Рәсімдеу мерзімі",       uz: "⏱ Rasmiylashtirish muddati",  tj: "⏱ Мӯҳлати расмикунонӣ"     }[lang] || "⏱ Срок оформления" },
+      ],
+    },
+  ]);
+}
+
+// ============================================================
+// Быстрые FAQ-ответы на кнопки
+// ============================================================
+
+function getQuickFaqAnswer(id, lang = "ru") {
+  const answers = {
+
+    // ── Вагоны ──────────────────────────────────────────────
+    faq_wagon_price: {
+      ru: "Цена жабық вагона зависит от маршрута, груза и текущих тарифов КТЖ.\n\nОриентировочно стоимость аренды крытого вагона на экспортных маршрутах — от $800 до $2000+, в зависимости от расстояния и загрузки.\n\nДля точного расчёта нужны: груз, маршрут (откуда–куда), вес и желаемая дата отправки.",
+      kz: "Жабық вагонның бағасы маршрутқа, жүкке және ҚТЖ тарифіне байланысты.\n\nЖуықша баға: экспорттық бағыттар бойынша $800–$2000+.\n\nДәл есептеу үшін керек: жүк, бағыт, салмақ, жөнелту күні.",
+      uz: "Yopiq vagon narxi marshrut, yuk va KTZ tarifiga bog'liq.\n\nYo'nalishga qarab taxminiy narx: $800–$2000+.\n\nAniq hisoblash uchun kerak: yuk, marshrut, og'irlik, jo'natish sanasi.",
+      tj: "Нархи вагони пӯшида ба масир, бор ва тарифи КТЖ вобаста аст.\n\nТахминан: $800–$2000+ барои масирҳои содиротӣ.\n\nБарои ҳисоби дақиқ лозим аст: бор, масир, вазн, санаи фиристодан.",
+    },
+
+    faq_wagon_capacity: {
+      ru: "Вместимость вагонов:\n\n🚃 Крытый вагон — 60–68 тонн (зерно в мешках, сахар, масло, паллеты)\n🌾 Хоппер / зерновоз — 60–75 тонн (пшеница, ячмень, кукуруза насыпью)\n🔩 Платформа — до 70 тонн (оборудование, техника, нестандартные грузы)\n📦 Контейнер 40 ft — до 28 тонн (сборные, тарные грузы)\n\nЕсли не знаете тип вагона — подберём под ваш груз.",
+      kz: "Вагондардың сыйымдылығы:\n\n🚃 Жабық вагон — 60–68 тонна\n🌾 Хоппер / зерновоз — 60–75 тонна\n🔩 Платформа — 70 тоннаға дейін\n📦 Контейнер 40 фут — 28 тоннаға дейін\n\nВагон түрін білмесеңіз — жүкке қарай таңдаймыз.",
+      uz: "Vagonlarning sig'imi:\n\n🚃 Yopiq vagon — 60–68 tonna\n🌾 Hopper / donvoz — 60–75 tonna\n🔩 Platforma — 70 tonnagacha\n📦 Konteyner 40 ft — 28 tonnagacha\n\nVagon turini bilmasangiz — yukka qarab tanlaymiz.",
+      tj: "Иқтидори вагонҳо:\n\n🚃 Вагони пӯшида — 60–68 тонна\n🌾 Хоппер / ғалладон — 60–75 тонна\n🔩 Платформа — то 70 тонна\n📦 Контейнер 40 фут — то 28 тонна\n\nАгар намуди вагонро надонед — мо интихоб мекунем.",
+    },
+
+    faq_wagon_types: {
+      ru: "Типы вагонов, с которыми работаем:\n\n🚃 Крытый вагон — для зерна в мешках, сахара, масла в таре, паллетированных грузов\n🌾 Хоппер / зерновоз — для пшеницы, ячменя, кукурузы и других сыпучих насыпью\n🔩 Платформа — для техники, оборудования, нестандартных грузов\n📦 Контейнер — для сборных, тарных и контейнерных грузов\n\nПодберём оптимальный тип под ваш груз и маршрут.",
+      kz: "Жұмыс жасайтын вагон түрлері:\n\n🚃 Жабық вагон — қаптамалы астық, қант, май\n🌾 Хоппер / зерновоз — себілетін астық\n🔩 Платформа — техника, жабдық\n📦 Контейнер — жинақты жүктер\n\nЖүкке сай оңтайлы вагон түрін таңдаймыз.",
+      uz: "Biz ishlatiladigan vagon turlari:\n\n🚃 Yopiq vagon — qoplardagi don, shakar, moy, palletlar\n🌾 Hopper / donvoz — bug'doy, arpa, makkajo'xori nasypyu\n🔩 Platforma — texnika, uskunalar\n📦 Konteyner — yig'ma yuklar\n\nYukingizga mos vagon turini tanlaymiz.",
+      tj: "Намудҳои вагоне, ки кор мекунем:\n\n🚃 Вагони пӯшида — ғалла дар халта, шакар, равған\n🌾 Хоппер / ғалладон — гандум, ҷав, ҷуворимакка\n🔩 Платформа — техника, таҷҳизот\n📦 Контейнер — борҳои омехта\n\nНамуди муносибро барои бори шумо интихоб мекунем.",
+    },
+
+    faq_wagon_booking: {
+      ru: "Вагоны желательно бронировать заранее — особенно в сезон (апрель–октябрь).\n\nЧем раньше подаётся заявка, тем выше шанс получить нужный тип вагона в нужную дату.\n\nОбычно бронирование подтверждается после согласования маршрута, груза и оплаты. Уточните дату — посмотрю наличие.",
+      kz: "Вагондарды алдын ала брондаған дұрыс — әсіресе маусымда (сәуір–қазан).\n\nӨтінім ерте берілсе, қажетті вагонды алу мүмкіндігі жоғары.\n\nЖөнелту күнін айтыңыз — қолжетімділікті тексеремін.",
+      uz: "Vagonlarni oldindan bron qilish tavsiya etiladi — ayniqsa mavsum paytida (aprel–oktyabr).\n\nAriza qanchalik erta berilsa, kerakli vagonni olish ehtimoli shunchalik yuqori.\n\nJo'natish sanasini ayting — mavjudligini tekshiraman.",
+      tj: "Вагонҳоро аз пеш бронирование кардан маъқул аст — хусусан дар мавсум (апрел–октябр).\n\nҲарчи зудтар дархост дода шавад, ҳамон қадар имкони гирифтани вагон зиёдтар аст.\n\nСанаи фиристоданро гӯед — мавҷудиятро месанҷам.",
+    },
+
+    faq_payment: {
+      ru: "Порядок оплаты:\n\n💳 Обычно: предоплата 50–100% до отправки вагона.\n🏦 Оплата по безналичному расчёту на расчётный счёт компании.\n📑 После оплаты — выставляется счёт-фактура и оформляется договор.\n\nТочные условия оплаты обсуждаются индивидуально. Напишите объём и маршрут — подготовлю детали.",
+      kz: "Төлем тәртібі:\n\n💳 Әдетте: вагон жіберілмес бұрын 50–100% алдын ала төлем.\n🏦 Қолма-қол емес есеп арқылы төленеді.\n📑 Төлемнен кейін шот-фактура және шарт рәсімделеді.\n\nТолық шарттарды маршрут пен көлемді айтқаннан кейін дайындаймын.",
+      uz: "To'lov tartibi:\n\n💳 Odatda: jo'natishdan oldin 50–100% oldindan to'lov.\n🏦 Naqd pulsiz hisob orqali to'lanadi.\n📑 To'lovdan keyin hisob-faktura va shartnoma rasmiylashtiriladi.\n\nBatafsil shartlarni marshrut va hajmni bilgandan keyin tayyorlayman.",
+      tj: "Тартиби пардохт:\n\n💳 Одатан: 50–100% пешпардохт пеш аз фиристодани вагон.\n🏦 Пардохт тавассути ҳисоби бонкӣ.\n📑 Пас аз пардохт — ҳисоб-фактура ва шартнома расмӣ мешавад.\n\nШартҳои дақиқро пас аз донистани масир ва ҳаҷм омода мекунам.",
+    },
+
+    faq_min_order: {
+      ru: "Минимальный объём — один вагон.\n\n🌾 Хоппер / зерновоз: от 60 тонн\n🚃 Крытый вагон: от 60 тонн\n\nЕсли груза меньше — уточните объём, подберём оптимальное решение: возможно подходит контейнер или сборный вариант.",
+      kz: "Ең аз тапсырыс — бір вагон.\n\n🌾 Хоппер: 60 тоннадан\n🚃 Жабық вагон: 60 тоннадан\n\nЖүк аз болса — көлемін айтыңыз, оңтайлы шешім табамыз.",
+      uz: "Minimal hajm — bitta vagon.\n\n🌾 Hopper: 60 tonnadan\n🚃 Yopiq vagon: 60 tonnadan\n\nYuk kamroq bo'lsa — hajmni ayting, optimal echim topamiz.",
+      tj: "Ҳаҷми ҳадди аққал — як вагон.\n\n🌾 Хоппер: аз 60 тонна\n🚃 Вагони пӯшида: аз 60 тонна\n\nАгар бор камтар бошад — ҳаҷмро гӯед, роҳи муносиб меёбем.",
+    },
+
+    // ── Маршруты ────────────────────────────────────────────
+    faq_route_kz_uz: {
+      ru: "🇺🇿 Казахстан → Узбекистан\n\n⏱ Срок: 3–5 суток в среднем (зависит от станции отправления и назначения).\n📍 Популярные маршруты: Алматы / Шымкент / Туркестан → Ташкент / Самарканд / Фергана.\n📋 Документы: обычно требуется СТ-1 (сертификат происхождения), для зерновых — фитосанитарный сертификат.\n\nКакой груз и откуда планируете?",
+      kz: "🇺🇿 Қазақстан → Өзбекстан\n\n⏱ Мерзім: орташа 3–5 тәулік.\n📍 Танымал бағыттар: Алматы / Шымкент → Ташкент / Самарқанд.\n📋 Құжаттар: СТ-1, астық үшін — фитосанитарлық сертификат.\n\nҚандай жүк және қайдан жоспарлап отырсыз?",
+      uz: "🇺🇿 Qozog'iston → O'zbekiston\n\n⏱ Muddat: o'rtacha 3–5 kun.\n📍 Mashhur yo'nalishlar: Olma-Ota / Shymkent → Toshkent / Samarqand.\n📋 Hujjatlar: ST-1, donlar uchun — fitosanitariya sertifikati.\n\nQanday yuk va qayerdan?",
+      tj: "🇺🇿 Қазоқистон → Ӯзбекистон\n\n⏱ Мӯҳлат: миёнаи 3–5 шабонарӯз.\n📍 Масирҳои маъмул: Олма-Ато / Шымкент → Тошканд / Самарқанд.\n📋 Ҳуҷҷатҳо: СТ-1, барои ғалла — гувоҳномаи фитосанитарӣ.\n\nЧӣ намуди бор ва аз куҷо?",
+    },
+
+    faq_route_kz_tj: {
+      ru: "🇹🇯 Казахстан → Таджикистан\n\n⏱ Срок: 5–8 суток в среднем.\n📍 Маршрут идёт через Узбекистан (транзит).\n📋 Документы: СТ-1, для зерновых — фитосанитарный сертификат, экспортная декларация.\n\nТранзит через Узбекистан потребует дополнительного согласования — уточняем маршрут индивидуально.",
+      kz: "🇹🇯 Қазақстан → Тәжікстан\n\n⏱ Мерзім: орташа 5–8 тәулік.\n📍 Маршрут Өзбекстан арқылы өтеді (транзит).\n📋 Құжаттар: СТ-1, фитосанитарлық сертификат, экспорттық декларация.\n\nТранзиттік рәсімдеу жеке талқыланады.",
+      uz: "🇹🇯 Qozog'iston → Tojikiston\n\n⏱ Muddat: o'rtacha 5–8 kun.\n📍 Marshrut O'zbekiston orqali o'tadi (tranzit).\n📋 Hujjatlar: ST-1, fitosanitariya sertifikati, eksport deklaratsiyasi.\n\nTranzit rasmiylashuvi individual muhokama qilinadi.",
+      tj: "🇹🇯 Қазоқистон → Тоҷикистон\n\n⏱ Мӯҳлат: миёнаи 5–8 шабонарӯз.\n📍 Масир тавассути Ӯзбекистон (транзит).\n📋 Ҳуҷҷатҳо: СТ-1, гувоҳномаи фитосанитарӣ, декларацияи содиротӣ.\n\nТранзит алоҳида мувофиқа карда мешавад.",
+    },
+
+    faq_route_kz_af: {
+      ru: "🇦🇫 Казахстан → Афганистан\n\n⏱ Срок: 10–18 суток в среднем.\n📍 Маршрут идёт через Узбекистан, далее через пограничный переход (Хайратон).\n📋 Документы: СТ-1, фитосанитарный сертификат, экспортная декларация, транзитные документы.\n\nЭто наше ключевое направление — работаем регулярно. Уточните груз и объём.",
+      kz: "🇦🇫 Қазақстан → Ауғанстан\n\n⏱ Мерзім: орташа 10–18 тәулік.\n📍 Маршрут Өзбекстан арқылы, Хайратон шекара өткелі арқылы.\n📋 Құжаттар: СТ-1, фитосанитарлық сертификат, декларация, транзиттік құжаттар.\n\nБасты бағытымыздың бірі — тұрақты жұмыс жасаймыз.",
+      uz: "🇦🇫 Qozog'iston → Afgʻoniston\n\n⏱ Muddat: o'rtacha 10–18 kun.\n📍 Marshrut O'zbekiston orqali, Xayraton chegara o'tkazib yuborish punkti.\n📋 Hujjatlar: ST-1, fitosanitariya sertifikati, deklaratsiya, tranzit hujjatlar.\n\nAsosiy yo'nalishimiz — muntazam ishlayapmiz.",
+      tj: "🇦🇫 Қазоқистон → Афғонистон\n\n⏱ Мӯҳлат: миёнаи 10–18 шабонарӯз.\n📍 Масир тавассути Ӯзбекистон, гузаргоҳи Ҳайратон.\n📋 Ҳуҷҷатҳо: СТ-1, гувоҳномаи фитосанитарӣ, декларатсия, ҳуҷҷатҳои транзитӣ.\n\nМасири асосии мо — кор мекунем мунтазам.",
+    },
+
+    faq_stations: {
+      ru: "Станции загрузки зависят от вашего груза и маршрута.\n\n📍 Работаем со станциями по всему Казахстану: Алматы, Шымкент, Туркестан, Астана, Костанай, Павлодар, Актобе, Атырау, Усть-Каменогорск, Семей, Кызылорда и другие.\n\nНапишите, откуда планируете грузить — уточню ближайшие подходящие станции.",
+      kz: "Жүк тиеу станциялары жүк пен бағытқа байланысты.\n\n📍 Қазақстан бойынша барлық негізгі станциялармен жұмыс жасаймыз: Алматы, Шымкент, Астана, Павлодар және т.б.\n\nҚайдан жүк тиегіңіз келетінін айтыңыз — жақын станцияларды нақтылаймын.",
+      uz: "Yuklash stansiyalari yukingiz va marshrutingizga bog'liq.\n\n📍 Qozog'istonning barcha asosiy stansiyalari bilan ishlaymiz: Olma-Ota, Shymkent, Nur-Sultan, Pavlodar va boshqalar.\n\nQayerdan yuklashni rejalashtirganingizni ayting — yaqin stansiyalarni aniqlayman.",
+      tj: "Истгоҳҳои боргирӣ ба бор ва масири шумо вобаста аст.\n\n📍 Бо ҳамаи истгоҳҳои асосии Қазоқистон кор мекунем: Олма-Ато, Шымкент, Нур-Султон, Павлодар ва ғайра.\n\nАз куҷо боргирӣ мекунед — гӯед, истгоҳи наздикро равшан мекунам.",
+    },
+
+    faq_tracking: {
+      ru: "📡 Да, отслеживание груза доступно.\n\nВагоны можно отследить через систему КТЖ (Қазақстан Темір Жолы) — по номеру вагона.\n\nПосле отправки предоставляем номер вагона и помогаем с мониторингом движения груза на маршруте.",
+      kz: "📡 Иә, жүкті қадағалау мүмкін.\n\nВагондарды ҚТЖ жүйесі арқылы — вагон нөмірі бойынша — қадағалауға болады.\n\nЖөнелтілгеннен кейін вагон нөмірін береміз және қозғалысты бақылауға көмектесеміз.",
+      uz: "📡 Ha, yukni kuzatish mumkin.\n\nVagonlarni KTZ tizimi orqali — vagon raqami bo'yicha — kuzatish mumkin.\n\nJo'natilgandan keyin vagon raqamini beramiz va harakat monitoringida yordam beramiz.",
+      tj: "📡 Бале, пайгирии бор имконпазир аст.\n\nВагонҳоро тавассути системаи КТЖ — тибқи рақами вагон — пайгирӣ кардан мумкин.\n\nПас аз фиристодан рақами вагонро медиҳем ва дар назорати ҳаракат кӯмак мекунем.",
+    },
+
+    faq_goods: {
+      ru: "Работаем с широким спектром грузов:\n\n🌾 Зерновые: пшеница, ячмень, кукуруза, рис, льняное семя, хлопковое семя\n🍬 Продовольствие: сахар, подсолнечное масло, мука\n📦 Тарные и паллетированные грузы\n🏗 Промышленные: цемент, металл, оборудование, техника\n\nЕсли не уверены, подходит ли ваш груз — напишите, уточним.",
+      kz: "Жүктердің кең ауқымымен жұмыс жасаймыз:\n\n🌾 Астық: бидай, арпа, жүгері, күріш, зығыр, мақта тұқымы\n🍬 Тамақ: қант, күнбағыс майы, ұн\n📦 Қаптамалы жүктер\n🏗 Өнеркәсіптік: цемент, металл, жабдық\n\nЖүкіңіз туралы жазыңыз — тексеріп береміз.",
+      uz: "Keng doiradagi yuklarni tashiymiz:\n\n🌾 Donli: bug'doy, arpa, makkajo'xori, guruch, zig'ir, paxta urug'i\n🍬 Oziq-ovqat: shakar, o'simlik yogi, un\n📦 Tarali va palletlangan yuklar\n🏗 Sanoat: sement, metall, uskunalar\n\nYukingiz haqida yozing — tekshiramiz.",
+      tj: "Мо бо доираи васеи борҳо кор мекунем:\n\n🌾 Ғалла: гандум, ҷав, ҷуворимакка, биринҷ, тухмии зағир, тухмии пахта\n🍬 Хӯрок: шакар, равғани офтобпараст, орд\n📦 Борҳои тарадӣ ва паллетӣ\n🏗 Саноатӣ: сементу металл ва таҷҳизот\n\nДар бораи бори худ нависед — месанҷем.",
+    },
+
+    // ── Документы ───────────────────────────────────────────
+    faq_doc_st1: {
+      ru: "📜 СТ-1 — сертификат происхождения товара.\n\n✅ Для Узбекистана и Таджикистана — как правило, требуется.\n🌾 Особенно важен для зерновых, сахара, масла.\n🏛 Оформляется через Торгово-промышленную палату (ТПП) Казахстана.\n⏱ Срок оформления: 1–3 рабочих дня.\n\nМы помогаем с подготовкой документов. Уточните груз и направление — скажу, нужен ли СТ-1 именно для вас.",
+      kz: "📜 СТ-1 — тауар шығу тегін растайтын сертификат.\n\n✅ Өзбекстан мен Тәжікстанға — әдетте талап етіледі.\n🏛 Қазақстан ТПП арқылы рәсімделеді.\n⏱ Дайындалу мерзімі: 1–3 жұмыс күні.\n\nЖүкті және бағытты айтыңыз — сізге керек пе, жоқ па, айтамын.",
+      uz: "📜 ST-1 — tovar kelib chiqishi sertifikati.\n\n✅ O'zbekiston va Tojikiston uchun — odatda talab qilinadi.\n🏛 Qozog'iston TPP orqali rasmiylashtiriladi.\n⏱ Muddati: 1–3 ish kuni.\n\nYuk va yo'nalishni ayting — sizga kerakligini aniqlayman.",
+      tj: "📜 СТ-1 — гувоҳномаи пайдоиши мол.\n\n✅ Барои Ӯзбекистон ва Тоҷикистон — одатан лозим аст.\n🏛 Тавассути ТТП Қазоқистон расмӣ мешавад.\n⏱ Мӯҳлат: 1–3 рӯзи корӣ.\n\nБор ва масирро гӯед — зарур аст ё не, мегӯям.",
+    },
+
+    faq_doc_phyto: {
+      ru: "🌿 Фитосанитарный сертификат (Фито).\n\n📋 Требуется для: пшеницы, ячменя, кукурузы, риса, льняного и хлопкового семени и других растительных грузов.\n🏛 Выдаётся Комитетом государственной инспекции в АПК (КазАгро / МСХ РК).\n⏱ Оформление: 1–3 рабочих дня + время на лабораторный анализ.\n\nНужен ли фитосанитарный сертификат — зависит от вашего груза и страны назначения. Уточните — помогу разобраться.",
+      kz: "🌿 Фитосанитарлық сертификат.\n\n📋 Керек: бидай, арпа, жүгері, күріш, зығыр, мақта тұқымы.\n🏛 КазАгро / ҚР АШМ арқылы берілді.\n⏱ Рәсімдеу: 1–3 жұмыс күні + зертханалық талдау.\n\nСізге керек пе — жүкті айтыңыз, нақтылаймын.",
+      uz: "🌿 Fitosanitariya sertifikati.\n\n📋 Kerak: bug'doy, arpa, makkajo'xori, guruch, zig'ir, paxta urug'i.\n🏛 KazAgro / QR QXV orqali beriladi.\n⏱ Muddat: 1–3 ish kuni + laboratoriya tahlili.\n\nSizga kerakligini bilish uchun yukni ayting.",
+      tj: "🌿 Гувоҳномаи фитосанитарӣ.\n\n📋 Лозим аст барои: гандум, ҷав, ҷуворимакка, биринҷ, тухмии зағир, тухмии пахта.\n🏛 Тавассути КазАгро / ВКХ ҶТ дода мешавад.\n⏱ Мӯҳлат: 1–3 рӯзи корӣ + таҳлили озмоишгоҳӣ.\n\nБарои донистани зарурат — бори худро гӯед.",
+    },
+
+    faq_doc_quality: {
+      ru: "✅ Сертификат качества (ветеринарный, качества зерна и др.) зависит от конкретного груза и требований страны назначения.\n\n🌾 Для зерновых: сертификат качества зерна выдаётся зерновой лабораторией или элеватором.\n🐄 Для продуктов животного происхождения: ветеринарный сертификат.\n\nУточните ваш груз — скажу, какие именно сертификаты потребуются.",
+      kz: "✅ Сапа сертификаты жүкке және тағайындалған елдің талаптарына байланысты.\n\n🌾 Астық үшін: астық зертханасы немесе элеватор береді.\n\nЖүкті айтыңыз — қандай сертификаттар қажет екенін нақтылаймын.",
+      uz: "✅ Sifat sertifikati yukka va manzil mamlakatining talablariga bog'liq.\n\n🌾 Donlar uchun: don laboratoriyasi yoki elevator beradi.\n\nYukni ayting — qanday sertifikatlar kerakligini aniqlayman.",
+      tj: "✅ Гувоҳномаи сифат ба бор ва талаботи кишвари мақсад вобаста аст.\n\n🌾 Барои ғалла: озмоишгоҳи ғалла ё элеватор медиҳад.\n\nБорро гӯед — кадом гувоҳномаҳо лозим аст мегӯям.",
+    },
+
+    faq_doc_declaration: {
+      ru: "📋 Экспортная декларация.\n\n🏛 Оформляется таможенным брокером в Казахстане.\n💼 Мы работаем с проверенными брокерами — помогаем подготовить и подать декларацию.\n📄 Для декларации нужны: инвойс, контракт, ТН ВЭД код, данные о грузе и транспорте.\n⏱ Срок: 1–2 рабочих дня при наличии всех документов.\n\nПомогу организовать оформление — уточните груз и маршрут.",
+      kz: "📋 Экспорттық декларация.\n\n🏛 Қазақстандағы кедендік брокер арқылы рәсімделеді.\n💼 Сенімді брокерлермен жұмыс жасаймыз — дайындауға көмектесеміз.\n⏱ Мерзімі: барлық құжаттар болса 1–2 жұмыс күні.\n\nЖүк пен бағытты айтыңыз — рәсімдеуді ұйымдастырамын.",
+      uz: "📋 Eksport deklaratsiyasi.\n\n🏛 Qozog'istondagi bojxona brokeri tomonidan rasmiylashtiriladi.\n💼 Ishonchli brokerlar bilan ishlaymiz — tayyorlashda yordam beramiz.\n⏱ Muddat: barcha hujjatlar bo'lsa 1–2 ish kuni.\n\nYuk va yo'nalishni ayting — rasmiylashtirishni tashkil etaman.",
+      tj: "📋 Декларацияи содиротӣ.\n\n🏛 Тавассути брокери гумрукии Қазоқистон расмӣ мешавад.\n💼 Бо брокерони боваркунанда кор мекунем — дар тайёр кардан кӯмак мекунем.\n⏱ Мӯҳлат: агар ҳамаи ҳуҷҷатҳо бошанд — 1–2 рӯзи корӣ.\n\nБор ва масирро гӯед — расмикунониро ташкил мекунам.",
+    },
+
+    faq_doc_tnved: {
+      ru: "🔢 ТН ВЭД коды (основные для наших грузов):\n\n🌾 Пшеница — 1001\n🌾 Ячмень — 1003\n🌾 Кукуруза — 1005\n🌾 Рис — 1006\n🍬 Сахар — 1701\n🫙 Масло подсолнечное — 1512\n🌱 Льняное семя — 1204\n🌿 Хлопковое семя — 1207\n\nТочный код определяется по виду и характеристикам вашего груза. Уточните — помогу подобрать правильный код.",
+      kz: "🔢 ТН СЭҚ кодтары (негізгі жүктер):\n\n🌾 Бидай — 1001\n🌾 Арпа — 1003\n🌾 Жүгері — 1005\n🌾 Күріш — 1006\n🍬 Қант — 1701\n🫙 Күнбағыс майы — 1512\n🌱 Зығыр тұқымы — 1204\n🌿 Мақта тұқымы — 1207\n\nДәл кодты жүктің түріне қарай анықтаймыз.",
+      uz: "🔢 TN VED kodlari (asosiy yuklar uchun):\n\n🌾 Bug'doy — 1001\n🌾 Arpa — 1003\n🌾 Makkajo'xori — 1005\n🌾 Guruch — 1006\n🍬 Shakar — 1701\n🫙 O'simlik yogi — 1512\n🌱 Zig'ir urug'i — 1204\n🌿 Paxta urug'i — 1207\n\nAniq kodni yukingizning turiga qarab aniqlaymiz.",
+      tj: "🔢 Рамзҳои ТН ВЭД (барои борҳои асосӣ):\n\n🌾 Гандум — 1001\n🌾 Ҷав — 1003\n🌾 Ҷуворимакка — 1005\n🌾 Биринҷ — 1006\n🍬 Шакар — 1701\n🫙 Равғани офтобпараст — 1512\n🌱 Тухмии зағир — 1204\n🌿 Тухмии пахта — 1207\n\nРамзи дақиқро тибқи намуди бор муайян мекунем.",
+    },
+
+    faq_doc_customs: {
+      ru: "🏛 Таможенное оформление для экспорта из Казахстана.\n\n📄 Необходимые документы:\n1. Контракт (договор купли-продажи)\n2. Инвойс\n3. ТН ВЭД код\n4. Экспортная декларация\n5. СТ-1 (для Узбекистана и Таджикистана)\n6. Фитосанитарный сертификат (для зерновых)\n7. Транспортные документы (накладная)\n\n⏱ Срок оформления: при наличии всех документов — 1–3 рабочих дня.\n\nПомогаем организовать весь пакет документов. Уточните груз и маршрут.",
+      kz: "🏛 Қазақстаннан экспортқа арналған кедендік рәсімдеу.\n\n📄 Қажетті құжаттар:\n1. Контракт\n2. Инвойс\n3. ТН СЭҚ коды\n4. Экспорттық декларация\n5. СТ-1\n6. Фитосанитарлық сертификат\n7. Тасымалдау құжаттары\n\n⏱ Мерзімі: барлық құжаттар болса 1–3 жұмыс күні.\n\nЖүк пен бағытты айтыңыз — барлық құжаттарды ұйымдастырамыз.",
+      uz: "🏛 Qozog'istondan eksport uchun bojxona rasmiylashuvi.\n\n📄 Kerakli hujjatlar:\n1. Kontrakt\n2. Invoice\n3. TN VED kodi\n4. Eksport deklaratsiyasi\n5. ST-1\n6. Fitosanitariya sertifikati\n7. Transport hujjatlari\n\n⏱ Muddat: barcha hujjatlar bo'lsa 1–3 ish kuni.\n\nYuk va yo'nalishni ayting — hujjatlar paketini tashkil etaman.",
+      tj: "🏛 Расмикунонии гумрукӣ барои содирот аз Қазоқистон.\n\n📄 Ҳуҷҷатҳои лозимӣ:\n1. Шартнома\n2. Инвойс\n3. Рамзи ТН ВЭД\n4. Декларацияи содиротӣ\n5. СТ-1\n6. Гувоҳномаи фитосанитарӣ\n7. Ҳуҷҷатҳои нақлиётӣ\n\n⏱ Мӯҳлат: агар ҳама ҳуҷҷатҳо бошанд — 1–3 рӯзи корӣ.\n\nБор ва масирро гӯед — ҳамаи ҳуҷҷатҳоро ташкил мекунем.",
+    },
+
+    faq_doc_contract: {
+      ru: "🤝 Контракт и инвойс.\n\n📑 Контракт (договор) оформляем на каждую отправку — включает маршрут, груз, объём, цену, условия оплаты и сроки.\n🔢 Номер контракта присваивается автоматически при оформлении заявки.\n📄 Инвойс (invoice) готовим по данным клиента — наименование товара, объём, цена, реквизиты сторон.\n🧾 Шот-фактура (счёт-фактура) выставляется для казахстанских клиентов в соответствии с НК РК.\n\nВсе документы готовим в рамках одной заявки. Уточните детали — приступим к оформлению.",
+      kz: "🤝 Контракт және инвойс.\n\n📑 Контракт (шарт) әрбір жөнелтілімге рәсімделеді.\n🔢 Контракт нөмірі өтінімді тіркеу кезінде автоматты түрде беріледі.\n📄 Инвойс клиент деректері бойынша дайындалады.\n🧾 Шот-фактура ҚР СК талаптарына сай беріледі.\n\nБарлық құжаттарды бір өтінім шеңберінде дайындаймыз.",
+      uz: "🤝 Kontrakt va invoice.\n\n📑 Kontrakt har bir jo'natma uchun rasmiylashtiriladi.\n🔢 Kontrakt raqami ariza rasmiy bo'lganda avtomatik beriladi.\n📄 Invoice mijoz ma'lumotlari asosida tayyorlanadi.\n🧾 Hisob-faktura QR NK talablariga muvofiq beriladi.\n\nBarcha hujjatlarni bitta ariza doirasida tayyorlaymiz.",
+      tj: "🤝 Шартнома ва инвойс.\n\n📑 Шартнома барои ҳар як интиқол расмӣ мешавад.\n🔢 Рақами шартнома ҳангоми сабти дархост автоматӣ дода мешавад.\n📄 Инвойс тибқи маълумоти муштарӣ омода мешавад.\n🧾 Ҳисоб-фактура мутобиқи НК ҶТ дода мешавад.\n\nҲамаи ҳуҷҷатҳоро дар доираи як дархост тайёр мекунем.",
+    },
+
+    faq_doc_packaging: {
+      ru: "📦 Требования к упаковке зависят от типа вагона и груза:\n\n🚃 Крытый вагон: зерно в мешках (50 кг, полипропилен), масло в ёмкостях, сахар в мешках, паллетированные грузы с крепёжными ремнями.\n🌾 Хоппер / зерновоз: насыпной груз без упаковки (пшеница, ячмень, кукуруза).\n📦 Контейнер: тарные, паллетированные грузы, возможна насыпь в биг-бэгах.\n\nЕсли не уверены по упаковке — уточните груз, подскажу.",
+      kz: "📦 Қаптама талаптары вагон түрі мен жүкке байланысты:\n\n🚃 Жабық вагон: қаптамалы астық, май, қант, паллеттер.\n🌾 Хоппер: үйілмелі жүк (қаптамасыз).\n📦 Контейнер: қаптамалы жүктер, биг-бэгтер.\n\nЖүк туралы айтыңыз — қаптама талаптарын нақтылаймын.",
+      uz: "📦 Qadoqlash talablari vagon turi va yukka bog'liq:\n\n🚃 Yopiq vagon: qoplardagi don, moy, shakar, palletlar.\n🌾 Hopper: nasypyu yuk (qadoqsiz).\n📦 Konteyner: tarali yuklar, big-beglar.\n\nYukni ayting — qadoqlash talablarini aniqlayman.",
+      tj: "📦 Талабот ба бастабандӣ ба намуди вагон ва бор вобаста аст:\n\n🚃 Вагони пӯшида: ғалла дар халта, равған, шакар, паллетҳо.\n🌾 Хоппер: бори фурӯхта (бе бастабандӣ).\n📦 Контейнер: борҳои тарадӣ, биг-бэгҳо.\n\nБорро гӯед — талаботро равшан мекунам.",
+    },
+
+    faq_doc_time: {
+      ru: "⏱ Сроки оформления документов:\n\n📜 СТ-1: 1–3 рабочих дня\n🌿 Фитосанитарный сертификат: 1–3 рабочих дня + лабораторный анализ (2–5 дней)\n📋 Экспортная декларация: 1–2 рабочих дня\n🤝 Контракт / Инвойс: 1 рабочий день\n🏛 Таможенное оформление (полный пакет): 3–7 рабочих дней\n\n⚡ При срочной отправке — уточните дату, постараемся ускорить процесс.",
+      kz: "⏱ Құжаттарды рәсімдеу мерзімдері:\n\n📜 СТ-1: 1–3 жұмыс күні\n🌿 Фитосанитарлық: 1–3 күн + зертхана (2–5 күн)\n📋 Декларация: 1–2 жұмыс күні\n🤝 Контракт / Инвойс: 1 жұмыс күні\n🏛 Толық пакет: 3–7 жұмыс күні\n\n⚡ Шұғыл жіберілсе — күнді айтыңыз, жеделдетуге тырысамыз.",
+      uz: "⏱ Hujjatlarni rasmiylashtirish muddatlari:\n\n📜 ST-1: 1–3 ish kuni\n🌿 Fitosanitariya: 1–3 kun + laboratoriya (2–5 kun)\n📋 Deklaratsiya: 1–2 ish kuni\n🤝 Kontrakt / Invoice: 1 ish kuni\n🏛 To'liq paket: 3–7 ish kuni\n\n⚡ Shoshilinch jo'natish uchun sanani ayting — tezlashtirishga harakat qilamiz.",
+      tj: "⏱ Мӯҳлатҳои расмикунонии ҳуҷҷатҳо:\n\n📜 СТ-1: 1–3 рӯзи корӣ\n🌿 Фитосанитарӣ: 1–3 рӯз + озмоишгоҳ (2–5 рӯз)\n📋 Декларатсия: 1–2 рӯзи корӣ\n🤝 Шартнома / Инвойс: 1 рӯзи корӣ\n🏛 Баста пурра: 3–7 рӯзи корӣ\n\n⚡ Барои фиристодани фаврӣ — санаро гӯед, кӯшиш мекунем зудтар анҷом диҳем.",
+    },
+  };
+
+  const entry = answers[id];
+  if (!entry) return null;
+  return entry[lang] || entry.ru;
+}
+
+// ============================================================
+// Отправка интерактивных кнопок (до 3 кнопок)
+// ============================================================
+
+async function sendInteractiveButtons(to, bodyText, buttons) {
+  if (!WHATSAPP_TOKEN || !PHONE_NUMBER_ID) return;
+
+  try {
+    const url = `https://graph.facebook.com/${GRAPH_API_VERSION}/${PHONE_NUMBER_ID}/messages`;
+
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${WHATSAPP_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        messaging_product: "whatsapp",
+        recipient_type: "individual",
+        to,
+        type: "interactive",
+        interactive: {
+          type: "button",
+          body: { text: bodyText },
+          action: {
+            buttons: buttons.map((btn) => ({
+              type: "reply",
+              reply: {
+                id: btn.id,
+                title: btn.title.substring(0, 20),
+              },
+            })),
+          },
+        },
+      }),
+    });
+
+    const data = await response.json();
+    if (!response.ok) console.error("sendInteractiveButtons error:", JSON.stringify(data));
+    else console.log(`[BUTTONS] sent to=${to} count=${buttons.length}`);
+  } catch (error) {
+    console.error("sendInteractiveButtons failed:", error);
+  }
+}
+
+// ============================================================
+// Отправка интерактивного списка (до 10 пунктов)
+// ============================================================
+
+async function sendInteractiveList(to, bodyText, buttonLabel, sections) {
+  if (!WHATSAPP_TOKEN || !PHONE_NUMBER_ID) return;
+
+  try {
+    const url = `https://graph.facebook.com/${GRAPH_API_VERSION}/${PHONE_NUMBER_ID}/messages`;
+
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${WHATSAPP_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        messaging_product: "whatsapp",
+        recipient_type: "individual",
+        to,
+        type: "interactive",
+        interactive: {
+          type: "list",
+          body: { text: bodyText },
+          action: {
+            button: buttonLabel.substring(0, 20),
+            sections: sections.map((section) => ({
+              title: (section.title || "").substring(0, 24),
+              rows: section.rows.map((row) => ({
+                id: row.id,
+                title: (row.title || "").substring(0, 24),
+                description: (row.description || "").substring(0, 72),
+              })),
+            })),
+          },
+        },
+      }),
+    });
+
+    const data = await response.json();
+    if (!response.ok) console.error("sendInteractiveList error:", JSON.stringify(data));
+    else console.log(`[LIST] sent to=${to} sections=${sections.length}`);
+  } catch (error) {
+    console.error("sendInteractiveList failed:", error);
+  }
 }
 
 // ============================================================
