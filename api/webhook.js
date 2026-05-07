@@ -42,6 +42,19 @@ const HISTORY_TTL_MS    = 30 * 60 * 1000;
 const MAX_HISTORY_TURNS = 10;
 
 // ============================================================
+// ДИАГНОСТИКА ПРИ ЗАПУСКЕ
+// ============================================================
+console.log("[INIT] Проверка переменных окружения:");
+console.log(`  ✓ VERIFY_TOKEN: ${VERIFY_TOKEN ? "✅ установлена" : "❌ НЕ установлена"}`);
+console.log(`  ✓ WHATSAPP_TOKEN: ${WHATSAPP_TOKEN ? "✅ установлена" : "❌ НЕ установлена"}`);
+console.log(`  ✓ PHONE_NUMBER_ID: ${PHONE_NUMBER_ID ? "✅ установлена" : "❌ НЕ установлена"}`);
+console.log(`  ✓ ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY ? "✅ установлена" : "❌ НЕ установлена"}`);
+console.log(`  ✓ GEMINI_API_KEY: ${GEMINI_API_KEY ? "✅ установлена" : "❌ НЕ установлена"}`);
+console.log(`  ✓ AMO_DOMAIN: ${AMO_DOMAIN ? `✅ ${AMO_DOMAIN}` : "❌ НЕ установлена (AmoCRM недоступна)"}`);
+console.log(`  ✓ AMO_TOKEN: ${AMO_TOKEN ? "✅ установлена" : "❌ НЕ установлена (AmoCRM недоступна)"}`);
+console.log(`  ✓ EXCEL_WEBHOOK_URL: ${EXCEL_WEBHOOK_URL ? "✅ установлена" : "❌ НЕ установлена"}`);
+
+// ============================================================
 // Webhook entry point
 // ============================================================
 
@@ -257,6 +270,11 @@ async function transcribeWithGemini(audioBuffer, lang) {
 // ============================================================
 
 async function processUserText(from, session, userText) {
+  console.log(`\n╔════════════════════════════════════════════`);
+  console.log(`║ 📱 Обработка сообщения от ${from}`);
+  console.log(`║ Текст: "${userText.substring(0, 60)}..."`);
+  console.log(`╚════════════════════════════════════════════\n`);
+
   appendToHistory(from, "user", userText);
   updateLeadDataFromText(session, userText);
   console.log("[LEAD_DATA]", JSON.stringify(session.leadData));
@@ -416,7 +434,7 @@ function buildGeminiContents(session) {
 // Базовый запрос к AmoCRM
 async function amoFetch(path, method = "GET", body = null) {
   if (!AMO_DOMAIN || !AMO_TOKEN) {
-    console.warn("[AMO] AMO_DOMAIN или AMO_TOKEN не заданы");
+    console.warn("[AMO] ⚠️ AMO_DOMAIN или AMO_TOKEN не установлены");
     return null;
   }
   try {
@@ -429,17 +447,26 @@ async function amoFetch(path, method = "GET", body = null) {
     };
     if (body) opts.body = JSON.stringify(body);
 
-    const resp = await fetch(`https://${AMO_DOMAIN}/api/v4${path}`, opts);
-    if (resp.status === 204) return true; // No Content — успех без тела
+    const fullUrl = `https://${AMO_DOMAIN}/api/v4${path}`;
+    const resp = await fetch(fullUrl, opts);
+    if (resp.status === 204) {
+      console.log(`[AMO] ${method} ${path} → 204 No Content (успех)`);
+      return true;
+    }
 
     if (!resp.ok) {
       const errText = await resp.text();
-      console.error(`[AMO] ${method} ${path} → ${resp.status}: ${errText}`);
+      console.error(`[AMO] ❌ ${method} ${path} → ${resp.status}`);
+      console.error(`[AMO]    Ошибка: ${errText.substring(0, 200)}`);
       return null;
     }
-    return resp.json();
+
+    const data = await resp.json();
+    console.log(`[AMO] ${method} ${path} → 200 OK`);
+    return data;
   } catch (err) {
-    console.error(`[AMO] Запрос упал: ${path}`, err);
+    console.error(`[AMO] ❌ Запрос упал: ${path}`);
+    console.error(`[AMO]    ${err.message}`);
     return null;
   }
 }
@@ -453,43 +480,70 @@ async function amoFindContact(phone) {
 
 // Создать контакт
 async function amoCreateContact({ name, phone, company }) {
-  const cfv = [{ field_code: "PHONE", values: [{ value: phone, enum_code: "WORK" }] }];
-  if (company) cfv.push({ field_code: "COMPANY", values: [{ value: company }] });
+  try {
+    console.log(`[AMO]    📋 POST /contacts (${name}, ${phone})`);
+    const cfv = [{ field_code: "PHONE", values: [{ value: phone, enum_code: "WORK" }] }];
+    if (company) cfv.push({ field_code: "COMPANY", values: [{ value: company }] });
 
-  const data = await amoFetch("/contacts", "POST", [{ name: name || phone, custom_fields_values: cfv }]);
-  const contact = data?._embedded?.contacts?.[0];
-  if (contact) console.log(`[AMO] Контакт создан #${contact.id}`);
-  return contact ?? null;
+    const data = await amoFetch("/contacts", "POST", [{ name: name || phone, custom_fields_values: cfv }]);
+    if (!data) {
+      console.error(`[AMO]    ❌ API ошибка при создании контакта`);
+      return null;
+    }
+    const contact = data?._embedded?.contacts?.[0];
+    if (contact) console.log(`[AMO]    ✅ Контакт #${contact.id} создан`);
+    return contact ?? null;
+  } catch (err) {
+    console.error(`[AMO]    ❌ Ошибка создания контакта:`, err.message);
+    return null;
+  }
 }
 
 // Создать лид и привязать к контакту
 async function amoCreateLead({ title, contactId, leadData }) {
-  const body = [{
-    name: title,
-    tags_to_add: [{ name: "WhatsApp" }],
-    _embedded: { contacts: [{ id: contactId }] },
-    ...(AMO_PIPELINE_ID ? { pipeline_id: Number(AMO_PIPELINE_ID) } : {}),
-  }];
+  try {
+    console.log(`[AMO]    📋 POST /leads (${title})`);
+    const body = [{
+      name: title,
+      tags_to_add: [{ name: "WhatsApp" }],
+      _embedded: { contacts: [{ id: contactId }] },
+      ...(AMO_PIPELINE_ID ? { pipeline_id: Number(AMO_PIPELINE_ID) } : {}),
+    }];
 
-  // Если в вашем AmoCRM есть кастомные поля — добавьте их сюда по field_id:
-  // body[0].custom_fields_values = [
-  //   { field_id: 12345, values: [{ value: leadData.cargo }] },
-  // ];
-
-  const data = await amoFetch("/leads", "POST", body);
-  const lead = data?._embedded?.leads?.[0];
-  if (lead) console.log(`[AMO] Лид создан #${lead.id}`);
-  return lead ?? null;
+    const data = await amoFetch("/leads", "POST", body);
+    if (!data) {
+      console.error(`[AMO]    ❌ API ошибка при создании лида`);
+      return null;
+    }
+    const lead = data?._embedded?.leads?.[0];
+    if (lead) console.log(`[AMO]    ✅ Лид #${lead.id} создан`);
+    return lead ?? null;
+  } catch (err) {
+    console.error(`[AMO]    ❌ Ошибка создания лида:`, err.message);
+    return null;
+  }
 }
 
 // Добавить примечание с полной перепиской
 async function amoAddNote(leadId, text) {
-  const data = await amoFetch(`/leads/${leadId}/notes`, "POST", [{
-    entity_id: leadId,
-    note_type: "common",
-    params: { text },
-  }]);
-  return data?._embedded?.notes?.[0] ?? null;
+  try {
+    console.log(`[AMO] 📝 Добавление примечания к лиду #${leadId}...`);
+    const data = await amoFetch(`/leads/${leadId}/notes`, "POST", [{
+      entity_id: leadId,
+      note_type: "common",
+      params: { text },
+    }]);
+    if (!data) {
+      console.error(`[AMO] ❌ Не удалось добавить примечание (API вернула null)`);
+      return null;
+    }
+    const note = data?._embedded?.notes?.[0];
+    if (note) console.log(`[AMO] ✅ Примечание #${note.id} добавлено`);
+    return note ?? null;
+  } catch (err) {
+    console.error(`[AMO] ❌ Ошибка добавления примечания:`, err.message);
+    return null;
+  }
 }
 
 // Найти последний открытый лид контакта
@@ -505,67 +559,104 @@ async function amoFindLeadByContact(contactId) {
 // Синхронизация каждого входящего сообщения (добавляет примечание к существующему лиду)
 async function syncMessageToAmoCRM(phone, session, userText, reason) {
   try {
+    if (!AMO_DOMAIN || !AMO_TOKEN) {
+      console.warn(`[AMO] Пропуск синхронизации (${reason}): AMO_DOMAIN или AMO_TOKEN не установлены`);
+      return;
+    }
+
     const leadData = session.leadData || {};
     const clientName = leadData.clientName || session.whatsappName || phone;
 
     // 1. Найти контакт
     let contact = await amoFindContact(phone);
-    if (!contact) return; // Контакт ещё не создан
+    if (!contact) {
+      console.log(`[AMO] ℹ️ Контакт для ${phone} ещё не создан (будет создан при горячей заявке)`);
+      return;
+    }
 
     // 2. Найти существующий лид
     let lead = await amoFindLeadByContact(contact.id);
-    if (!lead) return; // Лид ещё не создан
+    if (!lead) {
+      console.log(`[AMO] ℹ️ Лид для контакта #${contact.id} ещё не создан (будет создан при горячей заявке)`);
+      return;
+    }
 
     // 3. Добавить примечание с входящим сообщением
     const noteText = `[${new Date().toLocaleString('ru-RU')}] Клиент: ${userText}`;
-    await amoAddNote(lead.id, noteText);
-    console.log(`[AMO] Примечание добавлено к лиду #${lead.id}`);
+    const noteAdded = await amoAddNote(lead.id, noteText);
+    if (noteAdded) {
+      console.log(`[AMO] ✅ Примечание добавлено к лиду #${lead.id}`);
+    } else {
+      console.error(`[AMO] ❌ Не удалось добавить примечание к лиду #${lead.id}`);
+    }
   } catch (err) {
-    console.error("[AMO] syncMessageToAmoCRM error:", err);
+    console.error("[AMO] ❌ syncMessageToAmoCRM error:", err);
   }
 }
 
 // Главная функция синхронизации с AmoCRM
 async function syncToAmoCRM(phone, session, reason = "lead") {
   try {
+    if (!AMO_DOMAIN || !AMO_TOKEN) {
+      console.error("[AMO] ❌ Синхронизация пропущена: AMO_DOMAIN или AMO_TOKEN не установлены");
+      return false;
+    }
+
+    console.log(`[AMO] 🔄 Синхронизация начата (причина: ${reason})...`);
     const leadData   = session.leadData || {};
     const clientName = leadData.clientName || session.whatsappName || phone;
     const company    = leadData.company || "";
 
     // 1. Найти или создать контакт
+    console.log(`[AMO] 1️⃣ Поиск/создание контакта для ${phone}...`);
     let contact = await amoFindContact(phone);
     let contactCreated = false;
     if (!contact) {
+      console.log(`[AMO]    ↳ Контакт не найден, создаю новый...`);
       contact = await amoCreateContact({ name: clientName, phone, company });
       contactCreated = true;
     }
-    if (!contact) { console.error("[AMO] Не удалось создать контакт"); return false; }
+    if (!contact) {
+      console.error("[AMO] ❌ Не удалось создать контакт");
+      return false;
+    }
+    console.log(`[AMO]    ✅ Контакт #${contact.id} (${contactCreated ? "создан" : "найден"})`);
 
     // 2. Найти существующий лид или создать новый
+    console.log(`[AMO] 2️⃣ Поиск/создание лида...`);
     let lead = null;
     if (!contactCreated) {
       lead = await amoFindLeadByContact(contact.id);
     }
     if (!lead) {
+      console.log(`[AMO]    ↳ Лид не найден, создаю новый...`);
       lead = await amoCreateLead({
         title: buildLeadTitle(leadData, clientName),
         contactId: contact.id,
         leadData,
       });
     }
-    if (!lead) { console.error("[AMO] Не удалось создать лид"); return false; }
+    if (!lead) {
+      console.error("[AMO] ❌ Не удалось создать лид");
+      return false;
+    }
+    console.log(`[AMO]    ✅ Лид #${lead.id}`);
 
     // 3. Добавить примечание с данными заявки и последними сообщениями
+    console.log(`[AMO] 3️⃣ Добавление полной информации заявки...`);
     const noteText = buildAmoNote(session, reason, leadData);
-    await amoAddNote(lead.id, noteText);
+    const noteResult = await amoAddNote(lead.id, noteText);
+    if (!noteResult) {
+      console.error("[AMO] ⚠️ Примечание не добавлено, но лид создан");
+      return true;
+    }
 
     console.log(
-      `[AMO] Готово: контакт #${contact.id} (${contactCreated ? "новый" : "найден"}), ` +
-      `лид #${lead.id}, причина: ${reason}`
+      `[AMO] ✅ Готово: контакт #${contact.id}, лид #${lead.id}, причина: ${reason}`
     );
     return true;
   } catch (err) {
-    console.error("[AMO] syncToAmoCRM error:", err);
+    console.error("[AMO] ❌ syncToAmoCRM error:", err.message);
     return false;
   }
 }
@@ -614,7 +705,10 @@ function buildAmoNote(session, reason, leadData) {
 // ============================================================
 
 async function saveToExcel(phone, session, eventType, options = {}) {
-  if (!EXCEL_WEBHOOK_URL) { console.warn("[EXCEL] EXCEL_WEBHOOK_URL отсутствует"); return false; }
+  if (!EXCEL_WEBHOOK_URL) {
+    console.warn("[EXCEL] ❌ EXCEL_WEBHOOK_URL не установлена - данные не сохраняются");
+    return false;
+  }
 
   const dialogText   = session.messages.map((m) => {
     const time = m.timestamp ? new Date(m.timestamp).toLocaleTimeString('ru-RU') : "--:--:--";
@@ -639,15 +733,22 @@ async function saveToExcel(phone, session, eventType, options = {}) {
   };
 
   try {
+    console.log(`[EXCEL] 📤 Отправка данных (${eventType})...`);
     const resp = await fetch(EXCEL_WEBHOOK_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
-    if (!resp.ok) { console.error("[EXCEL] Ошибка:", resp.status); return false; }
-    console.log("[EXCEL] Сохранено");
+    if (!resp.ok) {
+      console.error(`[EXCEL] ❌ Ошибка ${resp.status}: не удалось отправить данные`);
+      return false;
+    }
+    console.log(`[EXCEL] ✅ Данные сохранены (${eventType})`);
     return true;
-  } catch (err) { console.error("[EXCEL] Ошибка запроса:", err); return false; }
+  } catch (err) {
+    console.error("[EXCEL] ❌ Ошибка запроса:", err.message);
+    return false;
+  }
 }
 
 // ============================================================
@@ -693,8 +794,12 @@ function getOrCreateSession(phone) {
 
 function appendToHistory(phone, role, content) {
   const session = conversationStore.get(phone);
-  if (!session) return;
+  if (!session) {
+    console.error(`[HISTORY] ⚠️ Сессия ${phone} не найдена`);
+    return;
+  }
   session.messages.push({ role, content, timestamp: new Date().toISOString() });
+  console.log(`[HISTORY] 💬 ${role === "assistant" ? "Бот" : "Клиент"}: "${content.substring(0, 50)}..."`);
   if (session.messages.length > MAX_HISTORY_TURNS * 2 + 2) {
     session.messages = [session.messages[0], ...session.messages.slice(-(MAX_HISTORY_TURNS * 2))];
   }
