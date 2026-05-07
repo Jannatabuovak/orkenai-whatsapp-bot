@@ -263,6 +263,9 @@ async function processUserText(from, session, userText) {
 
   await saveToExcel(from, session, "incoming_message", { userText, reason: "incoming_message" });
 
+  // Синхронизировать входящее сообщение в AmoCRM (добавить примечание)
+  await syncMessageToAmoCRM(from, session, userText, "incoming_message");
+
   // ── Ручной тест AmoCRM ────────────────────────────────────
   if (/^тест\s*crm$/i.test(userText) || /^test\s*crm$/i.test(userText)) {
     const ok = await syncToAmoCRM(from, session, "manual_crm_test");
@@ -499,6 +502,29 @@ async function amoFindLeadByContact(contactId) {
   return leads[leads.length - 1];
 }
 
+// Синхронизация каждого входящего сообщения (добавляет примечание к существующему лиду)
+async function syncMessageToAmoCRM(phone, session, userText, reason) {
+  try {
+    const leadData = session.leadData || {};
+    const clientName = leadData.clientName || session.whatsappName || phone;
+
+    // 1. Найти контакт
+    let contact = await amoFindContact(phone);
+    if (!contact) return; // Контакт ещё не создан
+
+    // 2. Найти существующий лид
+    let lead = await amoFindLeadByContact(contact.id);
+    if (!lead) return; // Лид ещё не создан
+
+    // 3. Добавить примечание с входящим сообщением
+    const noteText = `[${new Date().toLocaleString('ru-RU')}] Клиент: ${userText}`;
+    await amoAddNote(lead.id, noteText);
+    console.log(`[AMO] Примечание добавлено к лиду #${lead.id}`);
+  } catch (err) {
+    console.error("[AMO] syncMessageToAmoCRM error:", err);
+  }
+}
+
 // Главная функция синхронизации с AmoCRM
 async function syncToAmoCRM(phone, session, reason = "lead") {
   try {
@@ -553,7 +579,7 @@ function buildLeadTitle(leadData, clientName) {
   return parts.length ? parts.join(" ") : `WhatsApp: ${clientName}`;
 }
 
-// Текст примечания — данные заявки + переписка
+// Текст примечания — данные заявки + полная переписка с метками времени
 function buildAmoNote(session, reason, leadData) {
   const lines = [];
   lines.push(`📱 WhatsApp заявка [${reason}]`);
@@ -573,10 +599,11 @@ function buildAmoNote(session, reason, leadData) {
   if (leadData.company)       lines.push(`Компания: ${leadData.company}`);
   lines.push("");
 
-  lines.push("─── Переписка (последние сообщения) ───");
-  for (const m of session.messages.slice(-12)) {
+  lines.push("─── Полная переписка (все сообщения) ───");
+  for (const m of session.messages) {
     const who = m.role === "assistant" ? "Бот" : "Клиент";
-    lines.push(`${who}: ${m.content}`);
+    const time = m.timestamp ? new Date(m.timestamp).toLocaleTimeString('ru-RU') : "--:--:--";
+    lines.push(`[${time}] ${who}: ${m.content}`);
   }
 
   return lines.join("\n");
@@ -589,7 +616,10 @@ function buildAmoNote(session, reason, leadData) {
 async function saveToExcel(phone, session, eventType, options = {}) {
   if (!EXCEL_WEBHOOK_URL) { console.warn("[EXCEL] EXCEL_WEBHOOK_URL отсутствует"); return false; }
 
-  const dialogText   = session.messages.map((m) => `${m.role === "assistant" ? "Бот" : "Клиент"}: ${m.content}`).join("\n");
+  const dialogText   = session.messages.map((m) => {
+    const time = m.timestamp ? new Date(m.timestamp).toLocaleTimeString('ru-RU') : "--:--:--";
+    return `[${time}] ${m.role === "assistant" ? "Бот" : "Клиент"}: ${m.content}`;
+  }).join("\n");
   const userMessages = session.messages.filter((m) => m.role === "user").map((m) => m.content).join(" | ");
 
   const payload = {
@@ -664,7 +694,7 @@ function getOrCreateSession(phone) {
 function appendToHistory(phone, role, content) {
   const session = conversationStore.get(phone);
   if (!session) return;
-  session.messages.push({ role, content });
+  session.messages.push({ role, content, timestamp: new Date().toISOString() });
   if (session.messages.length > MAX_HISTORY_TURNS * 2 + 2) {
     session.messages = [session.messages[0], ...session.messages.slice(-(MAX_HISTORY_TURNS * 2))];
   }
